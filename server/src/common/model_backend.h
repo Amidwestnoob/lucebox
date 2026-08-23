@@ -265,6 +265,11 @@ struct GenerateResult {
     float                      accept_rate     = 0.0f;
     // True when spec decode actually ran (accept_rate==0 still needs a bandit update).
     bool                       spec_decode_ran = false;
+    // Bounded DFlash2 proposal telemetry. Zero/empty means the DFlash2 path
+    // did not run; ordinary DFlash remains represented by accept_rate.
+    uint64_t                   dflash2_proposed_tokens = 0;
+    uint64_t                   dflash2_accepted_tokens = 0;
+    std::vector<int32_t>       dflash2_observed_depths;
     // True when decode emitted only tokens that the API layer suppresses
     // (for example an immediate EOS/EOT). This is semantically equivalent
     // to zero output for clients and should take the same AR retry path as

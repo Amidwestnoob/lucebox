@@ -72,6 +72,137 @@ static ggml_tensor * draft_fuse_features(
     return target_feat;
 }
 
+// DFlash2 applies a learned two-tap grouped convolution on each side of the
+// attention and FFN sub-block. The generic ggml composition is deliberately
+// kept as the portable implementation; CUDA/HIP backends can fuse it later
+// without changing the trained tensor contract.
+static ggml_tensor * dflash2_grouped_conv(
+    ggml_context * ctx,
+    const DraftWeights & w,
+    ggml_tensor * hidden,
+    ggml_tensor * projected,
+    ggml_tensor * base,
+    int side) {
+    const int64_t n_embd = w.n_embd;
+    const int64_t group_size = w.dflash2_conv_group_size;
+    const int64_t n_groups = n_embd / group_size;
+    const int64_t taps = w.dflash2_conv_kernel_size;
+    const int64_t n_tokens = hidden->ne[1];
+    GGML_ASSERT(side == 0 || side == 1);
+    GGML_ASSERT(taps == 2);
+    GGML_ASSERT(hidden->ne[0] == n_embd);
+    GGML_ASSERT(projected->ne[0] == 2 * taps * n_groups);
+
+    ggml_tensor * blocks = ggml_reshape_3d(
+        ctx, hidden, group_size, n_groups, n_tokens);
+    const size_t delta_side_off =
+        (size_t)side * taps * n_groups * projected->nb[0];
+    ggml_tensor * delta = ggml_view_4d(
+        ctx, projected, 1, n_groups, taps, n_tokens,
+        projected->nb[0], n_groups * projected->nb[0], projected->nb[1],
+        delta_side_off);
+    delta = ggml_repeat_4d(ctx, delta, group_size, n_groups, taps, n_tokens);
+
+    ggml_tensor * base_side = ggml_view_4d(
+        ctx, base, group_size, n_groups, taps, 1,
+        group_size * base->nb[0], base->nb[1], base->nb[2],
+        (size_t)side * base->nb[2]);
+    base_side = ggml_cast(ctx, base_side, projected->type);
+    ggml_tensor * coeff = ggml_add(ctx, delta, base_side);
+    ggml_tensor * c0 = ggml_view_3d(
+        ctx, coeff, group_size, n_groups, n_tokens,
+        coeff->nb[1], coeff->nb[3], 0);
+    ggml_tensor * c1 = ggml_view_3d(
+        ctx, coeff, group_size, n_groups, n_tokens,
+        coeff->nb[1], coeff->nb[3], coeff->nb[2]);
+
+    ggml_tensor * first = ggml_view_3d(
+        ctx, blocks, group_size, n_groups, 1,
+        blocks->nb[1], blocks->nb[2], 0);
+    ggml_tensor * shifted = ggml_scale(ctx, first, 0.0f);
+    if (n_tokens > 1) {
+        ggml_tensor * prior = ggml_view_3d(
+            ctx, blocks, group_size, n_groups, n_tokens - 1,
+            blocks->nb[1], blocks->nb[2], 0);
+        shifted = ggml_concat(ctx, shifted, prior, 2);
+    }
+    if (n_tokens != w.block_size) {
+        ggml_tensor * position_mask = ggml_arange(
+            ctx, 0.0f, (float)w.block_size, 1.0f);
+        position_mask = ggml_clamp(ctx, position_mask, 0.0f, 1.0f);
+        position_mask = ggml_reshape_3d(ctx, position_mask, 1, 1, w.block_size);
+        const int64_t mask_tokens =
+            ((n_tokens + w.block_size - 1) / w.block_size) * w.block_size;
+        position_mask = ggml_repeat_4d(
+            ctx, position_mask, 1, 1, mask_tokens, 1);
+        position_mask = ggml_view_3d(
+            ctx, position_mask, 1, 1, n_tokens,
+            position_mask->nb[1], position_mask->nb[2], 0);
+        shifted = ggml_mul(ctx, shifted, position_mask);
+    }
+    ggml_tensor * out = ggml_add(
+        ctx, ggml_mul(ctx, c0, blocks), ggml_mul(ctx, c1, shifted));
+    return ggml_reshape_2d(ctx, out, n_embd, n_tokens);
+}
+
+static ggml_tensor * build_dflash2_selector(
+    ggml_context * ctx,
+    const DraftWeights & w,
+    ggml_tensor * anchor_token,
+    ggml_tensor * hidden,
+    ggml_tensor * logits) {
+    const int64_t n_steps = w.block_size - 1;
+    const int top_k = w.dflash2_selector_top_k;
+    GGML_ASSERT(n_steps > 0 && top_k > 0);
+    ggml_tensor * hidden_steps = ggml_view_2d(
+        ctx, hidden, hidden->ne[0], n_steps, hidden->nb[1], hidden->nb[1]);
+    hidden_steps = ggml_cont(ctx, hidden_steps);
+    ggml_tensor * projected = ggml_mul_mat(
+        ctx, w.dflash2_selector_hidden, hidden_steps);
+    ggml_tensor * candidates_all = ggml_top_k(ctx, logits, top_k);
+    ggml_tensor * previous = anchor_token;
+    ggml_tensor * selected_all = nullptr;
+
+    for (int64_t step = 0; step < n_steps; ++step) {
+        ggml_tensor * candidates = ggml_view_1d(
+            ctx, candidates_all, top_k,
+            (size_t)(step + 1) * candidates_all->nb[1]);
+        candidates = ggml_cont_1d(ctx, candidates, top_k);
+        ggml_tensor * successors = ggml_get_rows(
+            ctx, w.dflash2_selector_succ_f32
+                ? w.dflash2_selector_succ_f32 : w.dflash2_selector_succ,
+            candidates);
+        ggml_tensor * predecessor = ggml_get_rows(
+            ctx, w.dflash2_selector_pred_f32
+                ? w.dflash2_selector_pred_f32 : w.dflash2_selector_pred,
+            previous);
+        ggml_tensor * hidden_row = ggml_view_1d(
+            ctx, projected, projected->ne[0],
+            (size_t)step * projected->nb[1]);
+        hidden_row = ggml_reshape_2d(ctx, hidden_row, hidden_row->ne[0], 1);
+        ggml_tensor * score = ggml_mul_mat(
+            ctx, successors, ggml_mul(ctx, predecessor, hidden_row));
+
+        // ggml_get_rows indexes the source's second axis. View the vocabulary
+        // column as [1, vocab] so candidate token IDs gather scalar logits.
+        ggml_tensor * logits_row = ggml_view_2d(
+            ctx, logits, 1, logits->ne[0], logits->nb[0],
+            (size_t)(step + 1) * logits->nb[1]);
+        ggml_tensor * unary = ggml_get_rows(ctx, logits_row, candidates);
+        unary = ggml_reshape_2d(ctx, unary, top_k, 1);
+        score = ggml_add(ctx, score, unary);
+        ggml_tensor * best = ggml_argmax(ctx, score);
+        ggml_tensor * candidate_rows = ggml_reshape_2d(
+            ctx, candidates, 1, top_k);
+        ggml_tensor * selected = ggml_get_rows(ctx, candidate_rows, best);
+        selected = ggml_reshape_1d(ctx, selected, 1);
+        selected_all = selected_all
+            ? ggml_concat(ctx, selected_all, selected, 0) : selected;
+        previous = selected;
+    }
+    return selected_all;
+}
+
 DraftGraphOutputs build_draft_graph(
     ggml_context *            ctx,
     const DraftWeights &      w,
@@ -125,9 +256,17 @@ DraftGraphOutputs build_draft_graph(
             std::snprintf(probe_name, sizeof(probe_name), "draft_l%d_hn", il);
             ggml_set_name(hn, probe_name);
 
+            ggml_tensor * attn_in = hn;
+            ggml_tensor * attn_coeff = nullptr;
+            if (w.dflash2) {
+                attn_coeff = ggml_mul_mat(ctx, L.dflash2_attn_conv_proj, hn);
+                attn_in = dflash2_grouped_conv(
+                    ctx, w, hn, attn_coeff, L.dflash2_attn_conv_base, 0);
+            }
+
             // ── 2b. Q from noise only, then per-head RMSNorm
             //     wq: [hidden, q_dim=4096]
-            ggml_tensor * Q = ggml_mul_mat(ctx, L.wq, hn);  // [q_dim, q_len, 1]
+            ggml_tensor * Q = ggml_mul_mat(ctx, L.wq, attn_in);  // [q_dim, q_len, 1]
             Q = ggml_reshape_3d(ctx, Q, head_dim, n_head, q_len);  // [head_dim, n_head, q_len]
             Q = ggml_rms_norm(ctx, Q, eps);                        // normalize along head_dim
             Q = ggml_mul     (ctx, Q, L.q_norm);                   // broadcast [head_dim]
@@ -150,9 +289,9 @@ DraftGraphOutputs build_draft_graph(
                 tf_kv = ggml_mul(ctx, tf_kv, L.attn_norm);
             }
             ggml_tensor * Kctx = ggml_mul_mat(ctx, L.wk, tf_kv);  // [kv_dim, eff_ctx, 1]
-            ggml_tensor * Kn   = ggml_mul_mat(ctx, L.wk, hn);  // [kv_dim, q_len,   1]
+            ggml_tensor * Kn   = ggml_mul_mat(ctx, L.wk, attn_in);  // [kv_dim, q_len,   1]
             ggml_tensor * Vctx = ggml_mul_mat(ctx, L.wv, tf_kv);
-            ggml_tensor * Vn   = ggml_mul_mat(ctx, L.wv, hn);
+            ggml_tensor * Vn   = ggml_mul_mat(ctx, L.wv, attn_in);
             std::snprintf(probe_name, sizeof(probe_name), "draft_l%d_Kctx", il);
             ggml_set_name(Kctx, probe_name);
             std::snprintf(probe_name, sizeof(probe_name), "draft_l%d_Kn", il);
@@ -217,7 +356,7 @@ DraftGraphOutputs build_draft_graph(
             ggml_set_name(attn, probe_name);
             // attn result: [n_embd_v=head_dim, n_head, n_batch=q_len, 1]
             if (!disable_attn_gate && L.attn_gate) {
-                ggml_tensor * gate = ggml_mul_mat(ctx, L.attn_gate, hn);  // [n_head|q_dim, q_len]
+                ggml_tensor * gate = ggml_mul_mat(ctx, L.attn_gate, attn_in);  // [n_head|q_dim, q_len]
                 gate = ggml_softplus(ctx, gate);
                 std::snprintf(probe_name, sizeof(probe_name), "draft_l%d_gate", il);
                 ggml_set_name(gate, probe_name);
@@ -235,6 +374,10 @@ DraftGraphOutputs build_draft_graph(
             // ── 2g. Output projection + residual
             //     wo: [q_dim, hidden]  (ne[0]=q_dim, ne[1]=hidden)
             ggml_tensor * attn_out = ggml_mul_mat(ctx, L.wo, attn);  // [hidden, q_len]
+            if (w.dflash2) {
+                attn_out = dflash2_grouped_conv(
+                    ctx, w, attn_out, attn_coeff, L.dflash2_attn_conv_base, 1);
+            }
             std::snprintf(probe_name, sizeof(probe_name), "draft_l%d_attn_out", il);
             ggml_set_name(attn_out, probe_name);
             h = ggml_add(ctx, h, attn_out);
@@ -246,6 +389,12 @@ DraftGraphOutputs build_draft_graph(
             // ── 2h. FFN pre-norm
             ggml_tensor * hf = ggml_rms_norm(ctx, h, eps);
             hf = ggml_mul(ctx, hf, L.ffn_norm);
+            ggml_tensor * ffn_coeff = nullptr;
+            if (w.dflash2) {
+                ffn_coeff = ggml_mul_mat(ctx, L.dflash2_ffn_conv_proj, hf);
+                hf = dflash2_grouped_conv(
+                    ctx, w, hf, ffn_coeff, L.dflash2_ffn_conv_base, 0);
+            }
 
             // ── 2i. SwiGLU: down(silu(gate(x)) * up(x))
             //     w_gate, w_up: [hidden, intermediate]
@@ -255,6 +404,10 @@ DraftGraphOutputs build_draft_graph(
             ggml_tensor * u  = ggml_mul_mat(ctx, L.w_up,   hf);  // [inter, q_len]
             ggml_tensor * gu = ggml_mul(ctx, g, u);
             ggml_tensor * ffn_out = ggml_mul_mat(ctx, L.w_down, gu);  // [hidden, q_len]
+            if (w.dflash2) {
+                ffn_out = dflash2_grouped_conv(
+                    ctx, w, ffn_out, ffn_coeff, L.dflash2_ffn_conv_base, 1);
+            }
 
             h = ggml_add(ctx, h, ffn_out);
             std::snprintf(probe_name, sizeof(probe_name), "draft_l%d_h_after_ffn", il);
@@ -276,6 +429,11 @@ DraftGraphOutputs build_draft_graph(
         ggml_tensor * logits = ggml_mul_mat(ctx, in.lm_head, out);
         ggml_set_name(logits, "draft_logits");
         og.logits = logits;
+        if (w.dflash2 && in.anchor_token) {
+            og.selector_tokens = build_dflash2_selector(
+                ctx, w, in.anchor_token, out, logits);
+            ggml_set_name(og.selector_tokens, "dflash2_selector_tokens");
+        }
     }
     return og;
 }

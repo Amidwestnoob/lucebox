@@ -692,12 +692,22 @@ bool load_draft_safetensors(const std::string & path,
 }
 
 void free_draft_weights(DraftWeights & w) {
+    if (w.dflash2_selector_buf) {
+        ggml_backend_buffer_free(w.dflash2_selector_buf);
+        w.dflash2_selector_buf = nullptr;
+    }
+    if (w.dflash2_selector_ctx) {
+        ggml_free(w.dflash2_selector_ctx);
+        w.dflash2_selector_ctx = nullptr;
+    }
     if (w.buf) { ggml_backend_buffer_free(w.buf); w.buf = nullptr; }
     if (w.ctx) { ggml_free(w.ctx);                w.ctx = nullptr; }
     w.layers.clear();
     w.fc = nullptr;
     w.hidden_norm = nullptr;
     w.out_norm = nullptr;
+    w.dflash2_selector_pred_f32 = nullptr;
+    w.dflash2_selector_succ_f32 = nullptr;
     w.domino = DraftDominoWeights{};
 }
 

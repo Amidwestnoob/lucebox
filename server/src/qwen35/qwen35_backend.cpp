@@ -18,6 +18,8 @@
 #include "common/io_utils.h"
 #include "common/restore_delta.h"
 #include "common/specla_mode.h"
+#include "common/dflash2_speculation.h"
+#include "dflash2_native_commit.h"
 #include "qwen35_tensor_parallel.h"
 #include "qwen3/qwen3_drafter.h"
 #include "qwen3/qwen3_kvflash_scorer.h"
@@ -330,6 +332,31 @@ bool Qwen35Backend::init() {
                 dw_.layers[il].is_swa = true;
             std::printf("[draft]  SWA layers: %d/%d (window=%d)\n",
                         dw_.n_layer - 1, dw_.n_layer, dw_.swa_window);
+        }
+        if (dw_.dflash2 && !dw_.capture_layer_ids.empty()) {
+            if (dw_.capture_layer_ids.size() >
+                sizeof(w_.capture_layer_ids) / sizeof(w_.capture_layer_ids[0])) {
+                std::fprintf(stderr,
+                    "[draft] DFlash2 capture layer count %zu exceeds target capacity\n",
+                    dw_.capture_layer_ids.size());
+                return false;
+            }
+            w_.n_capture_layers = (int)dw_.capture_layer_ids.size();
+            for (int i = 0; i < w_.n_capture_layers; ++i) {
+                if (dw_.capture_layer_ids[(size_t)i] < 0 ||
+                    dw_.capture_layer_ids[(size_t)i] >= w_.n_layer) {
+                    std::fprintf(stderr,
+                        "[draft] DFlash2 capture layer id %d is outside target layer range\n",
+                        dw_.capture_layer_ids[(size_t)i]);
+                    return false;
+                }
+                w_.capture_layer_ids[i] = dw_.capture_layer_ids[(size_t)i];
+            }
+            std::printf("[draft]  DFlash2 capture layers:");
+            for (int i = 0; i < w_.n_capture_layers; ++i) {
+                std::printf(" %d", w_.capture_layer_ids[i]);
+            }
+            std::printf("\n");
         }
     }
 
@@ -1259,6 +1286,8 @@ GenerateResult Qwen35Backend::generate_impl(const GenerateRequest & req,
     if (req.do_sample && sampler_.seed != 0) {
         sampler_rng_.seed(sampler_.seed);
     }
+    active_prompt_tokens_ = req.prompt;
+    active_prompt_rebuild_allowed_ = true;
 
     // Zero delta-net recurrent state (SSM + conv) so a fresh prompt doesn't
     // inherit stale hidden state from the previous request. KV cache is
@@ -1354,6 +1383,9 @@ GenerateResult Qwen35Backend::generate_impl(const GenerateRequest & req,
                                        &req.budget_hook,
                                        &result.budget_forced_close,
                                        &result.degenerate_decode_close);
+            result.dflash2_proposed_tokens = dflash2_telemetry_.proposed_tokens;
+            result.dflash2_accepted_tokens = dflash2_telemetry_.accepted_tokens;
+            result.dflash2_observed_depths = dflash2_observed_depths_;
             if (decode_ok) {
                 result.empty_visible_output =
                     qwen35_empty_visible_output(result.tokens, w_);
@@ -1378,6 +1410,7 @@ GenerateResult Qwen35Backend::restore_and_generate_impl(int slot,
                                                         const DaemonIO & io) {
     GenerateResult result;
     DaemonIO out_io = io.with_token_callback(req.on_token);
+    active_prompt_rebuild_allowed_ = false;
     if (cfg_.paged_attention) {
         result.fail(GenerateErrorCode::BackendSpecific,
                     "paged-attention snapshots are not yet supported");
@@ -1521,6 +1554,9 @@ GenerateResult Qwen35Backend::restore_and_generate_impl(int slot,
                                        &req.budget_hook,
                                        &result.budget_forced_close,
                                        &result.degenerate_decode_close);
+            result.dflash2_proposed_tokens = dflash2_telemetry_.proposed_tokens;
+            result.dflash2_accepted_tokens = dflash2_telemetry_.accepted_tokens;
+            result.dflash2_observed_depths = dflash2_observed_depths_;
             if (decode_ok) {
                 result.empty_visible_output =
                     qwen35_empty_visible_output(result.tokens, w_);
@@ -2331,6 +2367,25 @@ bool Qwen35Backend::sync_local_draft_features(int start_pos, int n_tokens) {
 
 // ── DFlash speculative decode loop ─────────────────────────────────────
 
+// DFlash2 native commit: accepted draft tokens advance the target's
+// recurrent/KV state in place — fast rollback from F32 verify checkpoints
+// when available, restore+replay otherwise. EXPERIMENTAL and off by
+// default: bit-exact greedy parity of the committed state is validated
+// only for the RTX 3090 (SM 8.6) MMVQ kernel geometry with a Q4_K_L
+// target / Q4_K_M DFlash2 draft pair under greedy decoding. Opt in with
+// DFLASH_DFLASH2_NATIVE_COMMIT=1. Without the opt-in a DFlash2 draft
+// runs the diagnostic probe mode (real proposal/verify probes for
+// telemetry, then an exact one-token AR commit): identical output on any
+// hardware, no speculative speedup claimed.
+static bool dflash2_native_commit_enabled() {
+    static const bool enabled = []() {
+        const char * e = std::getenv("DFLASH_DFLASH2_NATIVE_COMMIT");
+        if (e == nullptr) return false;  // experimental: explicit opt-in only
+        return std::strcmp(e, "1") == 0;
+    }();
+    return enabled;
+}
+
 bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
                                     std::vector<int32_t> & out_tokens,
                                     const DaemonIO & io,
@@ -2345,6 +2400,8 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
                                     bool * degenerate_close_out) {
     out_accept_rate = 0.0f;
     out_spec_ran    = false;
+    dflash2_telemetry_ = {};
+    dflash2_observed_depths_.clear();
     // [TAG_DRAFT_KV] the drafter ring persists across requests but its rows
     // belong to the previous conversation; start every request empty (the
     // first begin_step bulk-appends the live window from the feature mirror).
@@ -2441,6 +2498,11 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
     // ── DFlash spec-decode: draft → verify → accept → replay ──────────
 
     DFlashTarget * target = dflash_target();
+    // This backend's dflash_target() factory always constructs a
+    // Qwen35DFlashTarget, so the AR-exact native-commit extensions can be
+    // reached through a typed pointer without widening the generic
+    // DFlashTarget interface.
+    Qwen35DFlashTarget * qtarget = static_cast<Qwen35DFlashTarget *>(target);
     auto finish_speculative_state = [&]() {
         if (target->finish_speculative_state()) return true;
         std::fprintf(stderr, "spec-decode: final SpecLA state flush failed\n");
@@ -2448,9 +2510,21 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
     };
     const bool use_remote_draft = cfg_.remote_draft.enabled() && remote_draft_.active();
     const int q_len = dw_.block_size > 0 ? dw_.block_size : DFLASH27B_DRAFT_BLOCK_SIZE;
+    const bool dflash2_adaptive_enabled = []() {
+        const char * value = std::getenv("DFLASH_DFLASH2_ADAPTIVE");
+        return !value || std::strcmp(value, "0") != 0;
+    }();
+    DFlash2AdaptiveController dflash2_adaptive(
+        std::max(0, q_len - 1), std::min(2, std::max(0, q_len - 1)),
+        dflash2_adaptive_enabled);
     const int max_verify_tokens = cfg_.ddtree_mode
         ? std::max<int>(dw_.block_size, cfg_.ddtree_budget + 1)
         : dw_.block_size;
+    target->set_force_verify_mask(dw_.dflash2);
+    // DFlash2 native commit: verify through the AR-exact interleaved rows so
+    // acceptance decisions, committed K/V rows, and recurrent state advance
+    // are bit-identical to target-only AR decode.
+    qtarget->set_ar_exact_rows(dw_.dflash2 && dflash2_native_commit_enabled());
     if ((cfg_.fast_rollback || cfg_.ddtree_mode) && !cache_.rollback_ctx) {
         const bool enable_specla = cfg_.fast_rollback &&
             !cfg_.device.is_tensor_parallel() && !kvflash_active();
@@ -2474,6 +2548,7 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
     std::vector<int32_t> pos_q(q_len);
     std::vector<int32_t> pos_k;
     std::vector<float>   local_hidden;
+    bool dflash2_selector_ready = false;
 
     int n_generated     = 0;
     int n_draft_steps   = 0;
@@ -2481,6 +2556,7 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
     int n_hint_proposed = 0;
     int n_hint_accepted = 0;
     int target_forwards = 0;
+    int dflash2_probe_cycles = 0;
     const ChainRollbackPolicy rollback_policy =
         resolve_chain_rollback_policy(cfg_.device.is_tensor_parallel(),
                                       target->exact_fast_rollback());
@@ -2529,8 +2605,27 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
 
     auto t_dec0 = std::chrono::steady_clock::now();
 
+    // Native-commit verify width cap: see kDflash2NativeCommitMaxDepth.
+    const int dflash2_depth_budget =
+        dw_.dflash2 && dflash2_native_commit_enabled()
+        ? std::min(q_len - 1, kDflash2NativeCommitMaxDepth)
+        : q_len - 1;
+
     while (n_generated < n_gen) {
+        dflash2_selector_ready = false;
         const int need_commit_budget = n_gen - n_generated;
+        const int dflash2_depth = dw_.dflash2
+            ? (dflash2_native_commit_enabled()
+                   ? dflash2_native_depth_floor(
+                         dflash2_adaptive.choose(dflash2_depth_budget),
+                         dflash2_depth_budget)
+                   : dflash2_adaptive.choose(dflash2_depth_budget))
+            : q_len - 1;
+        const int verify_len = dflash2_depth + 1;
+        if (dw_.dflash2 && dflash2_observed_depths_.size() < 256) {
+            dflash2_observed_depths_.push_back(dflash2_depth);
+        }
+        target->set_capture_target_features(true);
 
         // Budget hook: no tail-off here. The close-token injection fires
         // during the emit phase (step 8) after acceptance+replay, mirroring
@@ -2598,7 +2693,8 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
                 const char * e = std::getenv("DFLASH_DRAFT_KV");
                 return !(e && e[0] == '0' && e[1] == '\0');
             }();
-            bool use_draft_kv = draft_kv_on && feature_mirror_.target_feat != nullptr;
+            bool use_draft_kv = draft_kv_on && !dw_.dflash2 &&
+                                feature_mirror_.target_feat != nullptr;
             if (use_draft_kv && draft_kv_.gf &&
                 draft_kv_.built_for != (const void *)&dw_) {
                 draft_kv_free(draft_kv_);
@@ -2633,7 +2729,9 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
                 ggml_backend_tensor_get(draft_kv_.hidden_states, local_hidden.data(), 0,
                                         sizeof(float) * local_hidden.size());
             } else {
-                if (!build_draft_step(draft_sg, dw_, /*lm_head=*/nullptr, draft_backend_,
+                if (!build_draft_step(draft_sg, dw_,
+                                      dw_.dflash2 ? target->lm_head_tensor() : nullptr,
+                                      draft_backend_,
                                       draft_ctx, use_mirror_view ? &feature_mirror_ : nullptr,
                                       committed,
                                       /*ctx_len_max=*/std::min(ring_cap, std::max(DRAFT_CTX_MAX_DEFAULT, cfg_.draft_ctx_max)))) {
@@ -2650,6 +2748,10 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
                 }
                 ggml_backend_tensor_set(draft_sg.inp_embed, noise_embed.data(), 0,
                                         sizeof(float) * noise_embed.size());
+                if (dw_.dflash2) {
+                    ggml_backend_tensor_set(draft_sg.anchor_token, &last_tok, 0,
+                                            sizeof(last_tok));
+                }
                 pos_k.resize((size_t)draft_ctx + q_len);
                 for (int i = 0; i < q_len; i++) pos_q[i] = draft_ctx + i;
                 for (int i = 0; i < draft_ctx + q_len; i++) pos_k[i] = i;
@@ -2669,6 +2771,20 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
                 local_hidden.resize((size_t)hidden * q_len);
                 ggml_backend_tensor_get(draft_sg.hidden_states, local_hidden.data(), 0,
                                         sizeof(float) * local_hidden.size());
+                if (dw_.dflash2) {
+                    if (!draft_sg.selector_tokens) {
+                        std::fprintf(stderr,
+                            "spec-decode: DFlash2 selector output missing\n");
+                        step_graph_destroy(draft_sg);
+                        return false;
+                    }
+                    draft_tok.assign((size_t)q_len, 0);
+                    draft_tok[0] = last_tok;
+                    ggml_backend_tensor_get(
+                        draft_sg.selector_tokens, draft_tok.data() + 1, 0,
+                        sizeof(int32_t) * (size_t)(q_len - 1));
+                    dflash2_selector_ready = true;
+                }
             }
         }
         profile_add(profile_draft_s, profile_draft_start);
@@ -2702,12 +2818,12 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
              committed + cfg_.ddtree_budget + 1 + cfg_.kq_stride_pad <= kvflash_tokens_ &&
              kvflash_pager_.identity_prefix_covers(committed));
         const bool use_tree_verify =
-            cfg_.ddtree_mode && target->supports_tree_verify() && kvflash_tree_ok &&
+            cfg_.ddtree_mode && !dw_.dflash2 && target->supports_tree_verify() && kvflash_tree_ok &&
             !use_remote_draft && q_len > 1 && tree_special_inactive;
 
         // DDTree consumes top-K rows directly. Avoid projecting the same
         // hidden block once for argmax and again for top-K on every step.
-        if (!use_tree_verify) {
+        if (!use_tree_verify && !dw_.dflash2) {
             if (!target->project_hidden_to_tokens(local_hidden.data(), q_len, draft_tok)) {
                 std::fprintf(stderr, "spec-decode: projection failed\n");
                 step_graph_destroy(draft_sg);
@@ -2715,7 +2831,11 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
             }
             draft_tok[0] = last_tok;
         }
-
+        if (dw_.dflash2 && !dflash2_selector_ready && !use_tree_verify) {
+            std::fprintf(stderr, "spec-decode: DFlash2 selector did not produce a proposal\n");
+            step_graph_destroy(draft_sg);
+            return false;
+        }
         if (use_tree_verify) {
             const int L = q_len - 1;
             // The paper's end-to-end tree route uses top-k=4.  Wider top-k
@@ -3092,7 +3212,7 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
         int hint_fill = 0;
         if (hint_tokens && n_generated < (int)hint_tokens->size()) {
             const int hint_avail = (int)hint_tokens->size() - n_generated;
-            hint_fill = std::min(hint_avail, q_len - 1);
+            hint_fill = std::min(hint_avail, dflash2_depth);
             for (int i = 0; i < hint_fill; i++) {
                 draft_tok[1 + i] = (*hint_tokens)[n_generated + i];
             }
@@ -3104,20 +3224,57 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
         }
 
         // 4. Verify: snapshot KV, run target forward over draft tokens
+        const auto profile_snapshot_start = profile_start();
         if (!target->snapshot_kv()) {
             step_graph_destroy(draft_sg);
             return false;
         }
+        profile_add(profile_snapshot_s, profile_snapshot_start);
 
+        // Native commit verifies exactly the proposed rows: the AR-exact
+        // graph needs no fixed-width padding, and unproposed pad rows would
+        // only add forward cost at low adaptive depth. The probe path keeps
+        // the historical fixed width.
+        const std::vector<int32_t> verify_input =
+            dw_.dflash2 && !dflash2_native_commit_enabled()
+            ? dflash2_fixed_verify_tokens(
+                draft_tok, verify_len, q_len, target->mask_token_id())
+            : std::vector<int32_t>(
+                draft_tok.begin(), draft_tok.begin() + verify_len);
+        if (verify_input.empty()) {
+            std::fprintf(stderr, "spec-decode: invalid DFlash2 verify width\n");
+            step_graph_destroy(draft_sg);
+            return false;
+        }
         int verify_last_tok = -1;
-        if (!target->verify_batch(draft_tok, committed, verify_last_tok, &target_tok,
-                                   /*capture_ssm_intermediates=*/true)) {
+        // DFlash2 native commit captures per-row recurrent checkpoints during
+        // the verify so the accepted prefix commits by rollback_to() with no
+        // second target forward.
+        const auto profile_verify_start = profile_start();
+        if (!target->verify_batch(verify_input, committed, verify_last_tok, &target_tok,
+                                   /*capture_ssm_intermediates=*/
+                                   !dw_.dflash2 || dflash2_native_commit_enabled())) {
             std::fprintf(stderr, "spec-decode: verify failed\n");
             target->restore_kv();
             step_graph_destroy(draft_sg);
             return false;
         }
-        target_forwards++;
+        profile_add(profile_verify_s, profile_verify_start);
+        if (dw_.dflash2 && std::getenv("DFLASH_DFLASH2_TRACE")) {
+            std::fprintf(stderr,
+                "[dflash2-trace] step=%d committed=%d depth=%d verify_len=%d "
+                "draft_seed=%d draft_proposals=",
+                n_draft_steps, committed, dflash2_depth, verify_len, draft_tok[0]);
+            for (int i = 1; i < verify_len; ++i) {
+                std::fprintf(stderr, "%s%d", i == 1 ? "" : ",", draft_tok[i]);
+            }
+            std::fprintf(stderr, " target_predictions=");
+            for (int i = 0; i < verify_len; ++i) {
+                std::fprintf(stderr, "%s%d", i == 0 ? "" : ",", target_tok[i]);
+            }
+            std::fprintf(stderr, " target_last=%d cache_pos=%d\n",
+                         verify_last_tok, cache_.cur_pos);
+        }
 
         // 5. Acceptance. Greedy: longest matching prefix between draft and
         // target argmax. Sampled-verify: walk the chain drawing each next
@@ -3127,13 +3284,13 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
         int accept_n = 1;
         int bonus_tok = -1;
         if (sampled_verify) {
-            if (!target->read_verify_logits(q_len, verify_logits)) {
+            if (!target->read_verify_logits(verify_len, verify_logits)) {
                 std::fprintf(stderr, "spec-decode: verify logits read failed\n");
                 target->restore_kv();
                 step_graph_destroy(draft_sg);
                 return false;
             }
-            const int vocab_v = (int)(verify_logits.size() / (size_t)q_len);
+            const int vocab_v = (int)(verify_logits.size() / (size_t)verify_len);
             static const bool kSvDebug = []() {
                 const char * e = std::getenv("DFLASH_SV_DEBUG");
                 return e != nullptr && std::string(e) == "1";
@@ -3142,7 +3299,7 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
                 // Row-alignment check: CPU argmax over each bulk-read row must
                 // equal the GPU argmax (target_tok). Divergence = misaligned
                 // or stale bulk read.
-                for (int i = 0; i < q_len; i++) {
+                for (int i = 0; i < verify_len; i++) {
                     const float * row = verify_logits.data() + (size_t)i * vocab_v;
                     int am = 0; float best = row[0];
                     for (int v = 1; v < vocab_v; v++)
@@ -3167,7 +3324,7 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
             verify_history = out_tokens;
             verify_history.push_back(draft_tok[0]);
             bool mismatched = false;
-            for (int i = 0; i < q_len - 1; i++) {
+            for (int i = 0; i < verify_len - 1; i++) {
                 const int s = sample_logits(
                     verify_logits.data() + (size_t)i * vocab_v, vocab_v,
                     sampler_, verify_history, sampler_rng_);
@@ -3188,17 +3345,175 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
             }
             (void)mismatched;
         } else {
-            for (int i = 0; i < q_len - 1; i++) {
+            for (int i = 0; i < verify_len - 1; i++) {
                 if (draft_tok[i + 1] == target_tok[i]) accept_n++;
                 else break;
             }
-            bonus_tok = (accept_n < q_len) ? target_tok[accept_n - 1] : -1;
+            bonus_tok = (accept_n < verify_len) ? target_tok[accept_n - 1] : -1;
         }
         // Track hint acceptance telemetry.
         if (hint_fill > 0) {
             n_hint_proposed += hint_fill;
             n_hint_accepted += std::min(hint_fill, accept_n - 1);
         }
+        if (dw_.dflash2) {
+            const int accepted_draft = std::min(
+                dflash2_depth, std::max(0, accept_n - 1));
+            dflash2_adaptive.observe(dflash2_depth, accepted_draft);
+            dflash2_telemetry_ = dflash2_adaptive.telemetry();
+            std::fprintf(stderr,
+                "[dflash2] proposed=%d accepted=%d depth=%d\n",
+                dflash2_depth, accepted_draft, dflash2_depth);
+        }
+        if (dw_.dflash2 && !dflash2_native_commit_enabled()) {
+            // The native target verify is authoritative for acceptance, but
+            // Lucebox's Qwen3.8 hybrid batched recurrent commit is not yet
+            // numerically identical to the AR graph for variable widths. Run
+            // two real proposal/verify probes so adaptive depth observes the
+            // live acceptance signal, restore the pre-probe state, and commit
+            // the request through the exact one-token AR path. This is an
+            // intentionally negative/diagnostic path: no speculative speedup
+            // is claimed until the batched commit state is numerically repaired.
+            if (!target->restore_kv()) {
+                std::fprintf(stderr, "spec-decode: DFlash2 probe restore failed\n");
+                step_graph_destroy(draft_sg);
+                return false;
+            }
+            ++dflash2_probe_cycles;
+            step_graph_destroy(draft_sg);
+            if (dflash2_probe_cycles < 2) {
+                continue;
+            }
+            target->set_capture_target_features(true);
+            target->set_force_verify_mask(false);
+            if (active_prompt_rebuild_allowed_ && !active_prompt_tokens_.empty()) {
+                reset_recurrent_state(cache_);
+                cache_.cur_pos = 0;
+                DaemonIO rebuild_io;
+                const int rebuilt = do_prefill(active_prompt_tokens_, rebuild_io);
+                if (rebuilt != committed) {
+                    std::fprintf(stderr,
+                        "spec-decode: DFlash2 exact rebuild committed=%d expected=%d\n",
+                        rebuilt, committed);
+                    step_graph_destroy(draft_sg);
+                    return false;
+                }
+            }
+            out_accept_rate = dflash2_telemetry_.proposed_tokens > 0
+                ? (float)((double)dflash2_telemetry_.accepted_tokens /
+                          (double)dflash2_telemetry_.proposed_tokens)
+                : 0.0f;
+            const bool ok = do_ar_decode(
+                committed, n_gen, out_tokens, io,
+                budget_hook ? *budget_hook : BudgetHook{},
+                forced_close_out, degenerate_close_out);
+            io.emit(-1);
+            return ok;
+        }
+        // Margin-guarded native commit. Batched verify rows decide greedy
+        // acceptance with kernel numerics that are close to, but not
+        // bit-identical with, the one-token AR graph (matmul kernels change
+        // reduction layout with batch width). A decision made with a wide
+        // logit margin is stable across those numerics; a decision inside
+        // the guard band could resolve differently than AR, so the step is
+        // re-derived token by token through the exact AR graph instead.
+        bool exact_committed = false;
+        int replay_last_tok = -1;
+        if (dw_.dflash2 && dflash2_native_commit_enabled() && !sampled_verify) {
+            // Off by default: with the verify width capped at
+            // kDflash2NativeCommitMaxDepth the batched rows and committed
+            // state are bit-identical to AR decode by construction, so no
+            // decision can sit closer to a flip than zero. The guard stays
+            // available (DFLASH_DFLASH2_EXACT_MARGIN=<logits>) as defense in
+            // depth for hardware whose kernel tables differ from the
+            // validated RTX 3090 configuration.
+            static const float kExactMargin = []() {
+                const char * e = std::getenv("DFLASH_DFLASH2_EXACT_MARGIN");
+                return e ? (float)std::atof(e) : 0.0f;
+            }();
+            static const bool kMarginLog = []() {
+                const char * e = std::getenv("DFLASH_DFLASH2_MARGIN_LOG");
+                return e && std::strcmp(e, "0") != 0;
+            }();
+            bool need_exact = false;
+            float min_margin = 0.0f;
+            if (kExactMargin > 0.0f) {
+                need_exact = true;  // stay safe if logits are unavailable
+                if (target->read_verify_logits(accept_n, verify_logits) &&
+                    verify_logits.size() >= (size_t)accept_n) {
+                    const int vocab_v =
+                        (int)(verify_logits.size() / (size_t)accept_n);
+                    min_margin = 1e30f;
+                    for (int i = 0; i < accept_n; i++) {
+                        const float * row =
+                            verify_logits.data() + (size_t)i * vocab_v;
+                        float best = row[0], second = -1e30f;
+                        for (int v = 1; v < vocab_v; v++) {
+                            const float x = row[v];
+                            if (x > best) { second = best; best = x; }
+                            else if (x > second) { second = x; }
+                        }
+                        min_margin = std::min(min_margin, best - second);
+                    }
+                    need_exact = min_margin <= kExactMargin;
+                }
+            }
+            if (kMarginLog) {
+                std::fprintf(stderr,
+                    "[dflash2-margin] step=%d rows=%d min_margin=%.4f exact=%d\n",
+                    n_draft_steps, accept_n, min_margin, need_exact ? 1 : 0);
+            }
+            if (need_exact) {
+                // Re-derive this step with AR numerics: restore the
+                // pre-verify state and walk the proposals one exact AR step
+                // at a time. Acceptance, the correction token, and the next
+                // seed all come from the AR graph itself.
+                if (!target->restore_kv()) {
+                    step_graph_destroy(draft_sg);
+                    return false;
+                }
+                int cur = committed;
+                int step_argmax = -1;
+                if (!qtarget->ar_exact_step(draft_tok[0], cur, step_argmax)) {
+                    std::fprintf(stderr, "spec-decode: exact seed step failed\n");
+                    step_graph_destroy(draft_sg);
+                    return false;
+                }
+                target_forwards++;
+                cur++;
+                int exact_accept = 1;
+                while (exact_accept < verify_len &&
+                       exact_accept < need_commit_budget &&
+                       draft_tok[exact_accept] == step_argmax) {
+                    if (!qtarget->ar_exact_step(step_argmax, cur, step_argmax)) {
+                        std::fprintf(stderr,
+                                     "spec-decode: exact accept step failed\n");
+                        step_graph_destroy(draft_sg);
+                        return false;
+                    }
+                    target_forwards++;
+                    cur++;
+                    exact_accept++;
+                }
+                int exact_bonus = -1;
+                if (exact_accept < need_commit_budget) {
+                    exact_bonus = step_argmax;
+                    if (!qtarget->ar_exact_step(exact_bonus, cur, step_argmax)) {
+                        std::fprintf(stderr,
+                                     "spec-decode: exact bonus step failed\n");
+                        step_graph_destroy(draft_sg);
+                        return false;
+                    }
+                    target_forwards++;
+                    cur++;
+                }
+                accept_n = exact_accept;
+                bonus_tok = exact_bonus;
+                replay_last_tok = step_argmax;
+                exact_committed = true;
+            }
+        }
+
         int commit_n  = accept_n + (bonus_tok >= 0 ? 1 : 0);
         if (commit_n > need_commit_budget) {
             commit_n = need_commit_budget;
@@ -3211,11 +3526,20 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
         //    than the cost of deferring the bonus to the next step. TP uses
         //    device-local rollback; other paths use the configurable policy.
         rollback_diag.record_accept(accept_n);
+        // DFlash2 native commit takes the fast-rollback commit only with
+        // exact F32 checkpoints (DFLASH_SINGLE_CHAIN_CHECKPOINT_F32=1): the
+        // committed recurrent state must be bit-identical to a replay of the
+        // accepted rows. F16 checkpoints degrade to restore+replay, which is
+        // always exact.
+        const bool dflash2_fast_ok = dw_.dflash2 &&
+            dflash2_native_commit_enabled() && rollback_policy.checkpoint_f32 &&
+            !kvflash_active() && cfg_.fa_window == 0;
         const bool use_fast_rollback =
+            !exact_committed &&
+            (!dw_.dflash2 || dflash2_fast_ok) &&
             target->supports_fast_rollback() &&
             (accept_n >= rollback_policy.fast_rollback_threshold);
 
-        int replay_last_tok = -1;
         bool fast_rolled_back = false;
         if (use_fast_rollback) {
             // Fast rollback: restore SSM from captured intermediates, skip replay.
@@ -3226,7 +3550,9 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
             // budget (need_commit_budget), so committing accept_n would emit
             // more tokens than requested. commit_n was already clamped above.
             commit_n = std::min(accept_n, need_commit_budget);
+            const auto profile_rollback_start = profile_start();
             if (target->rollback_to(committed, commit_n)) {
+                profile_add(profile_rollback_s, profile_rollback_start);
                 replay_last_tok = target_tok[commit_n - 1];
                 fast_rolled_back = true;
                 rollback_diag.record_fast_rollback(accept_n);
@@ -3244,7 +3570,7 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
                 rollback_diag.record_failed_fallback();
             }
         }
-        if (!fast_rolled_back) {
+        if (!fast_rolled_back && !exact_committed) {
             rollback_diag.record_legacy_replay();
             // Legacy replay: restore SSM snapshot, replay accepted + bonus tokens.
             // (When falling back from fast-rollback, bonus_tok is -1 and commit_n
@@ -3435,8 +3761,10 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
             step_graph_destroy(draft_sg);
             cache_.last_tok = out_tokens.empty() ? last_tok : out_tokens.back();
             const int total_draft_pos = std::max(1, n_draft_steps * q_len);
-            out_accept_rate =
-                (float)((double)n_accept_sum / (double)total_draft_pos);
+            out_accept_rate = dw_.dflash2 && dflash2_telemetry_.proposed_tokens > 0
+                ? (float)((double)dflash2_telemetry_.accepted_tokens /
+                          (double)dflash2_telemetry_.proposed_tokens)
+                : (float)((double)n_accept_sum / (double)total_draft_pos);
             const int ar_n_gen = n_gen - n_generated;
             if (ar_n_gen <= 0) {
                 if (!finish_speculative_state()) return false;
@@ -3480,8 +3808,10 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
             step_graph_destroy(draft_sg);
             cache_.last_tok = out_tokens.empty() ? last_tok : out_tokens.back();
             const int total_draft_pos = std::max(1, n_draft_steps * q_len);
-            out_accept_rate =
-                (float)((double)n_accept_sum / (double)total_draft_pos);
+            out_accept_rate = dw_.dflash2 && dflash2_telemetry_.proposed_tokens > 0
+                ? (float)((double)dflash2_telemetry_.accepted_tokens /
+                          (double)dflash2_telemetry_.proposed_tokens)
+                : (float)((double)n_accept_sum / (double)total_draft_pos);
             const int ar_n_gen = n_gen - n_generated;
             if (ar_n_gen <= 0) {
                 if (!finish_speculative_state()) return false;
@@ -3512,7 +3842,10 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
     const double decode_s = std::chrono::duration<double>(t_dec1 - t_dec0).count();
     const int total_draft_pos = std::max(1, n_draft_steps * q_len);
     const double accept_pct = 100.0 * (double)n_accept_sum / (double)total_draft_pos;
-    out_accept_rate = (float)((double)n_accept_sum / (double)total_draft_pos);
+    out_accept_rate = dw_.dflash2 && dflash2_telemetry_.proposed_tokens > 0
+        ? (float)((double)dflash2_telemetry_.accepted_tokens /
+                  (double)dflash2_telemetry_.proposed_tokens)
+        : (float)((double)n_accept_sum / (double)total_draft_pos);
     std::fprintf(stderr, "[spec-decode] tokens=%d time=%.3f s speed=%.2f tok/s "
                  "steps=%d accepted=%d/%d (%.1f%%) avg_commit=%.2f\n",
                  n_generated, decode_s,

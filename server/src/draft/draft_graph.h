@@ -15,6 +15,7 @@ struct DraftGraphInputs {
     ggml_tensor * target_hidden_cat;// [5*hidden, ctx_len, 1] f32
     ggml_tensor * positions_q;      // [q_len] i32   values [ctx_len..ctx_len+q_len-1]
     ggml_tensor * positions_k;      // [ctx_len+q_len] i32   values [0..ctx_len+q_len-1]
+    ggml_tensor * anchor_token = nullptr; // [1] i32, DFlash2 selector anchor
     // Optional: if non-null, the graph projects final hidden states through
     // this LM head (shape [hidden, vocab]) and returns logits instead of
     // hidden states. Used for DFlash integration where the draft shares the
@@ -32,6 +33,7 @@ struct DraftGraphInputs {
 struct DraftGraphOutputs {
     ggml_tensor * hidden_states;    // [hidden, q_len, 1]  (always set)
     ggml_tensor * logits;           // [vocab, q_len, 1]   (non-null iff lm_head was provided)
+    ggml_tensor * selector_tokens = nullptr; // [q_len-1] i32 for DFlash2
 };
 
 DraftGraphOutputs build_draft_graph(

@@ -33,6 +33,7 @@ struct StepGraph {
 
     // Named inputs
     ggml_tensor *   inp_embed = nullptr;
+    ggml_tensor *   anchor_token = nullptr;   // DFlash2 selector anchor
     ggml_tensor *   positions = nullptr;
     ggml_tensor *   attn_mask = nullptr;     // may be null
     ggml_tensor *   parent_ids = nullptr;    // DDTree tree-mode; null for chain mode
@@ -74,6 +75,7 @@ struct StepGraph {
     ggml_tensor *   logits = nullptr;
     ggml_tensor *   hidden_states = nullptr;       // draft hidden-only output
     ggml_tensor *   argmax_tokens = nullptr; // [n_tokens] i32, GPU-side argmax of logits
+    ggml_tensor *   selector_tokens = nullptr; // [n_tokens-1] i32, DFlash2 path
     ggml_tensor *   topk_indices = nullptr;  // [K, n_tokens] i32, GPU-side top-K indices
     ggml_tensor *   ffn_residual = nullptr;  // [hidden, n_tokens] pre-FFN residual
     ggml_tensor *   ffn_post = nullptr;      // [hidden, n_tokens] post-attention norm
@@ -91,7 +93,7 @@ struct StepGraph {
 inline void step_graph_free(StepGraph & sg) {
     if (sg.ctx)   { ggml_free(sg.ctx); sg.ctx = nullptr; }
     sg.gf = nullptr;
-    sg.inp_embed = sg.positions = sg.attn_mask = nullptr;
+    sg.inp_embed = sg.anchor_token = sg.positions = sg.attn_mask = nullptr;
     sg.target_hidden_cat = sg.positions_k = nullptr;
     sg.pad_mask_full = nullptr;
     sg.ctx_alloc = 0;
@@ -109,6 +111,7 @@ inline void step_graph_free(StepGraph & sg) {
     sg.logits = nullptr;
     sg.hidden_states = nullptr;
     sg.argmax_tokens = nullptr;
+    sg.selector_tokens = nullptr;
     sg.topk_indices = nullptr;
     sg.ffn_residual = nullptr;
     sg.ffn_post = nullptr;

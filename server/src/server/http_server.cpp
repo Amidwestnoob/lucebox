@@ -2315,6 +2315,11 @@ json build_openai_completion_response(
         {"timings", build_timings_json(timings, counts.total)},
         {"accept_rate", result.accept_rate},
         {"spec_decode_ran", result.spec_decode_ran},
+        {"dflash2", {
+            {"proposed_tokens", result.dflash2_proposed_tokens},
+            {"accepted_tokens", result.dflash2_accepted_tokens},
+            {"observed_depths", result.dflash2_observed_depths},
+        }},
     };
     return {
         {"id", req.response_id},
@@ -2383,6 +2388,11 @@ json build_anthropic_response(
         {"timings", build_timings_json(timings, counts.total)},
         {"accept_rate", result.accept_rate},
         {"spec_decode_ran", result.spec_decode_ran},
+        {"dflash2", {
+            {"proposed_tokens", result.dflash2_proposed_tokens},
+            {"accepted_tokens", result.dflash2_accepted_tokens},
+            {"observed_depths", result.dflash2_observed_depths},
+        }},
     };
     return {
         {"id", req.response_id},
@@ -2433,6 +2443,11 @@ json build_responses_api_response(
         {"timings", build_timings_json(timings, counts.total)},
         {"accept_rate", result.accept_rate},
         {"spec_decode_ran", result.spec_decode_ran},
+        {"dflash2", {
+            {"proposed_tokens", result.dflash2_proposed_tokens},
+            {"accepted_tokens", result.dflash2_accepted_tokens},
+            {"observed_depths", result.dflash2_observed_depths},
+        }},
     };
     return {
         {"id", req.response_id},

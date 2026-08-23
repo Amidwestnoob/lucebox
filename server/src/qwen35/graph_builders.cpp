@@ -294,8 +294,18 @@ bool build_target_step(
     const QwenPrefillSegment * prefill_segments,
     int n_prefill_segments,
     int n_logits_rows,
-    bool compact_slots) {
+    bool compact_slots,
+    bool ar_exact_rows) {
     step_graph_free(sg);
+
+    // AR-exact rows: interleaved per-row KV write + maskless per-row FA.
+    // Causality comes from node order, not a mask; the paged/pool/windowed
+    // paths have their own causality mechanisms and never combine with it.
+    if (ar_exact_rows &&
+        (with_mask || fa_window != 0 || paged_attention || kvflash_mask ||
+         n_prefill_tokens > 0 || compact_slots)) {
+        return false;
+    }
 
     // Compact n_seqs is a decode graph bucket width, not the physical
     // slot count. active_slot_ids maps live rows to cache columns and uses -1
@@ -372,6 +382,13 @@ bool build_target_step(
         if (!found) return false;
     }
     int graph_key_slot = decode_key;
+    // AR-exact verify graphs are step-invariant per width (fixed 256-stride
+    // FA spans, set_rows destinations carried as data): give each width its
+    // own captured-graph key so alternating verify depths replay instead of
+    // thrashing the single default slot.
+    if (ar_exact_rows) {
+        graph_key_slot = 16 + n_tokens;
+    }
     if (paged_attention && paged_max_kv_len > 0) {
         // Paged graphs differ by their padded launch bound. Packed recurrent
         // graphs also differ by total width and every ragged segment length.
@@ -508,6 +525,7 @@ bool build_target_step(
     // multi-token, and feature-capturing forwards (decode AND spec verify).
     const bool use_kv_write_rows =
         paged_attention ||
+        ar_exact_rows ||
         (!g_no_kvpad && !capture_delta_intermediate &&
          (kvflash_mask
               ? (fa_window == 0)
@@ -566,7 +584,7 @@ bool build_target_step(
     gi.specla_n_waves             = hld_schedule.n_waves;
     gi.specla_n_boundaries        = hld_schedule.n_boundaries;
     gi.specla_max_parallel_chains = hld_schedule.max_parallel_chains;
-
+    Qwen35ArExactBuildScope ar_exact_scope(ar_exact_rows);
     QwenGraphOutputs go = build_qwen35_graph(sg.ctx, sg.gf, w, cache, gi);
     if (!go.logits) return false;
     sg.logits = go.logits;

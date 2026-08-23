@@ -23,7 +23,16 @@
 using to_fp32_cuda_t = void (*)(const void *, float *, int64_t, cudaStream_t);
 extern "C++" to_fp32_cuda_t ggml_get_to_fp32_cuda(ggml_type type);
 
+// Thread-local MMVQ ncols ceiling override (ggml-cuda.cu). The tuned default
+// routes quantized mul_mats with 4..8 columns through MMQ tile kernels, whose
+// per-element reduction order differs from the per-column MMVQ chain the
+// one-token AR graph uses. AR-exact verify raises the ceiling so every row of
+// the batch is computed by the same per-column kernel as AR decode,
+// bit-for-bit, at any verify width up to MMVQ's 8-column limit.
+extern "C" int ggml_backend_cuda_set_mmvq_max_ncols_override(int max_ncols);
+
 namespace dflash::common {
+
 namespace {
 
 bool is_meta_tensor(const ggml_tensor * tensor) {
@@ -217,6 +226,16 @@ bool copy_meta_recurrent_state(const std::vector<ggml_tensor *> & ssm_source,
 }  // namespace
 
 Qwen35DFlashTarget::~Qwen35DFlashTarget() {
+    if (staging_buf_) {
+        qwen35_set_ar_exact_feat_staging(nullptr);
+        feat_staging_ = nullptr;
+        ggml_backend_buffer_free(staging_buf_);
+        staging_buf_ = nullptr;
+    }
+    if (staging_ctx_) {
+        ggml_free(staging_ctx_);
+        staging_ctx_ = nullptr;
+    }
     step_graph_destroy(proj_sg_);
 }
 
@@ -244,7 +263,14 @@ bool Qwen35DFlashTarget::verify_batch(
 
     const int hidden = w_.n_embd;
     const bool pool = pager_ != nullptr;
-    const bool need_mask = pool || (kq_stride_pad_ > KQ_MASK_PAD) || (n_tokens > 1);
+    // AR-exact rows replace the causal mask with interleaved per-row KV
+    // writes + per-row AR-shaped flash attention (bit-identical to the AR
+    // decode step). Pool slots keep the masked path (slot-space validity
+    // cannot be expressed by node order alone), and a finite fa_window has
+    // no AR-graph equivalent.
+    const bool ar_exact = ar_exact_rows_ && !pool && fa_window_ == 0;
+    const bool need_mask = !ar_exact &&
+        (force_verify_mask_ || pool || (kq_stride_pad_ > KQ_MASK_PAD) || (n_tokens > 1));
 
     // kvflash: allocate slots for the verify block up front (may evict at
     // a chunk boundary; protections keep sinks + the tail window safe).
@@ -265,17 +291,50 @@ bool Qwen35DFlashTarget::verify_batch(
     // skip capture under the pager so --ddtree + --kvflash doesn't fail verify.
     const bool do_capture = fast_rollback_ && capture_ssm_intermediates && pager_ == nullptr;
 
+    if (ar_exact && capture_target_features_ && cache_.target_feat &&
+        !feat_staging_ && !ensure_feat_staging(DFLASH27B_DRAFT_BLOCK_SIZE)) {
+        return false;
+    }
+    qwen35_set_ar_exact_feat_staging(ar_exact ? feat_staging_ : nullptr);
+
     if (!build_target_step(sg_, w_, cache_, backend_,
                            /*kv_start=*/base_pos, n_tokens,
-                           need_mask, /*capture=*/true,
+                           /*with_mask=*/need_mask, /*capture=*/capture_target_features_,
                            /*capture_delta_intermediate=*/do_capture,
                            pool ? 0 : fa_window_,
                            /*logits_tail_rows=*/0,
                            kq_stride_pad_,
                            /*capture_moe_router=*/false,
-                           /*kvflash_mask=*/pool)) {
+                           /*kvflash_mask=*/pool,
+                           /*capture_qk=*/false,
+                           /*paged_attention=*/false,
+                           /*n_seqs=*/1,
+                           /*seq_slot=*/0,
+                           /*paged_max_kv_len=*/0,
+                           /*n_prefill_tokens=*/0,
+                           /*prefill_segments=*/nullptr,
+                           /*n_prefill_segments=*/0,
+                           /*n_logits_rows=*/0,
+                           /*compact_slots=*/false,
+                           /*ar_exact_rows=*/ar_exact)) {
         std::fprintf(stderr, "verify_batch: build_target_step failed (base=%d n=%d)\n", base_pos, n_tokens);
         return false;
+    }
+    if (ar_exact) {
+        if (!sg_.kv_write_rows) {
+            std::fprintf(stderr, "verify_batch: ar-exact requires kv_write_rows\n");
+            return false;
+        }
+        // Token-major [n_tokens, n_head_kv]: element (token i, head h) at
+        // i + h*n_tokens. Contiguous logical rows.
+        std::vector<int64_t> rows((size_t)n_tokens * w_.n_head_kv);
+        for (int h = 0; h < w_.n_head_kv; h++) {
+            for (int i = 0; i < n_tokens; i++) {
+                rows[(size_t)h * n_tokens + i] = base_pos + i;
+            }
+        }
+        ggml_backend_tensor_set(sg_.kv_write_rows, rows.data(), 0,
+                                sizeof(int64_t) * rows.size());
     }
     if (pool && !sg_.kv_write_rows) {
         std::fprintf(stderr, "verify_batch: kvflash requires set_rows path\n");
@@ -351,7 +410,17 @@ bool Qwen35DFlashTarget::verify_batch(
                                 sizeof(uint16_t) * mask_buf.size());
     }
 
+    // AR-exact rows require per-column MMVQ for every quantized projection so
+    // each row's numerics match the one-token AR graph exactly (see the
+    // override declaration above). Scoped to this compute only; the tuned
+    // MMQ crossover stays in effect everywhere else.
+    const int mmvq_prev = ar_exact
+        ? ggml_backend_cuda_set_mmvq_max_ncols_override(8)
+        : 0;
     auto st = ggml_backend_graph_compute(backend_, sg_.gf);
+    if (ar_exact) {
+        ggml_backend_cuda_set_mmvq_max_ncols_override(mmvq_prev);
+    }
     if (st != GGML_STATUS_SUCCESS) {
         std::fprintf(stderr, "verify_batch: compute failed (status=%d)\n", (int)st);
         return false;
@@ -363,11 +432,89 @@ bool Qwen35DFlashTarget::verify_batch(
                             sizeof(int32_t) * n_tokens);
     last_tok = argmax_buf[n_tokens - 1];
 
+    static const bool kVerifyArgmaxLog = []() {
+        const char * e = std::getenv("DFLASH_VERIFY_ARGMAX_LOG");
+        return e && std::strcmp(e, "0") != 0;
+    }();
+    if (kVerifyArgmaxLog) {
+        std::fprintf(stderr, "[verify-argmax] base=%d n=%d rows=", base_pos, n_tokens);
+        for (int i = 0; i < n_tokens; i++) {
+            std::fprintf(stderr, "%s%d", i == 0 ? "" : ",", argmax_buf[i]);
+        }
+        std::fprintf(stderr, "\n");
+    }
+
     if (all_argmax) {
         *all_argmax = std::move(argmax_buf);
     }
 
+    if (ar_exact && !flush_feat_staging(base_pos, n_tokens)) return false;
+
     cache_.cur_pos = base_pos + n_tokens;
+    return true;
+}
+
+bool Qwen35DFlashTarget::ar_exact_step(int32_t tok, int pos, int & argmax_out) {
+    if (pager_ != nullptr || fa_window_ != 0) return false;
+    const int hidden = w_.n_embd;
+    std::vector<float> embed((size_t)hidden);
+    if (!w_.embedder.embed(&tok, 1, embed.data())) {
+        std::fprintf(stderr, "ar_exact_step: embed failed (tok=%d)\n", tok);
+        return false;
+    }
+    if (capture_target_features_ && cache_.target_feat &&
+        !feat_staging_ && !ensure_feat_staging(DFLASH27B_DRAFT_BLOCK_SIZE)) {
+        return false;
+    }
+    qwen35_set_ar_exact_feat_staging(feat_staging_);
+    // n_tokens=1 through the AR-exact rows mode: identical node set to the
+    // AR decode graph (set_rows KV write, maskless padded FA span) plus the
+    // feature-capture taps, which read activations without changing them.
+    if (!build_target_step(sg_, w_, cache_, backend_,
+                           /*kv_start=*/pos, /*n_tokens=*/1,
+                           /*with_mask=*/false,
+                           /*capture=*/capture_target_features_,
+                           /*capture_delta_intermediate=*/false,
+                           /*fa_window=*/0,
+                           /*logits_tail_rows=*/0,
+                           kq_stride_pad_,
+                           /*capture_moe_router=*/false,
+                           /*kvflash_mask=*/false,
+                           /*capture_qk=*/false,
+                           /*paged_attention=*/false,
+                           /*n_seqs=*/1,
+                           /*seq_slot=*/0,
+                           /*paged_max_kv_len=*/0,
+                           /*n_prefill_tokens=*/0,
+                           /*prefill_segments=*/nullptr,
+                           /*n_prefill_segments=*/0,
+                           /*n_logits_rows=*/0,
+                           /*compact_slots=*/false,
+                           /*ar_exact_rows=*/true)) {
+        std::fprintf(stderr, "ar_exact_step: build_target_step failed (pos=%d)\n", pos);
+        return false;
+    }
+    ggml_backend_tensor_set(sg_.inp_embed, embed.data(), 0,
+                            sizeof(float) * (size_t)hidden);
+    int32_t pos4[4] = {pos, pos, pos, 0};
+    ggml_backend_tensor_set(sg_.positions, pos4, 0, sizeof(int32_t) * 4);
+    if (!sg_.kv_write_rows) {
+        std::fprintf(stderr, "ar_exact_step: kv_write_rows missing\n");
+        return false;
+    }
+    std::vector<int64_t> rows((size_t)w_.n_head_kv, (int64_t)pos);
+    ggml_backend_tensor_set(sg_.kv_write_rows, rows.data(), 0,
+                            sizeof(int64_t) * rows.size());
+    auto st = ggml_backend_graph_compute(backend_, sg_.gf);
+    if (st != GGML_STATUS_SUCCESS) {
+        std::fprintf(stderr, "ar_exact_step: compute failed (status=%d)\n", (int)st);
+        return false;
+    }
+    if (!flush_feat_staging(pos, 1)) return false;
+    int32_t am = -1;
+    ggml_backend_tensor_get(sg_.argmax_tokens, &am, 0, sizeof(int32_t));
+    argmax_out = am;
+    cache_.cur_pos = pos + 1;
     return true;
 }
 
@@ -850,10 +997,62 @@ bool Qwen35DFlashTarget::rollback_to_tree(
     return true;
 }
 
+bool Qwen35DFlashTarget::ensure_feat_staging(int max_rows) {
+    if (feat_staging_) return true;
+    if (!cache_.target_feat || max_rows <= 0) return false;
+    ggml_init_params ip{};
+    ip.mem_size   = 4 * ggml_tensor_overhead();
+    ip.mem_buffer = nullptr;
+    ip.no_alloc   = true;
+    staging_ctx_ = ggml_init(ip);
+    if (!staging_ctx_) return false;
+    // Same dtype as the ring: the in-graph capture cpy converts F32
+    // activations exactly as the legacy direct-to-ring cpy did, and the
+    // post-compute flush becomes a raw same-type column copy.
+    ggml_tensor * st = ggml_new_tensor_2d(
+        staging_ctx_, cache_.target_feat->type,
+        cache_.target_feat->ne[0], max_rows);
+    ggml_set_name(st, "target_feat_staging");
+    staging_buf_ = ggml_backend_alloc_ctx_tensors(staging_ctx_, backend_);
+    if (!staging_buf_) {
+        ggml_free(staging_ctx_);
+        staging_ctx_ = nullptr;
+        return false;
+    }
+    feat_staging_ = st;
+    return true;
+}
+
+// Copy the staged capture columns into the target_feat ring at their real
+// slots. The backend is synchronous with the host here (the argmax read
+// after graph compute completed), matching rollback_to's memcpy pattern.
+bool Qwen35DFlashTarget::flush_feat_staging(int base_pos, int n_tokens) {
+    ggml_tensor * st = feat_staging_;
+    if (!st || !cache_.target_feat || cache_.target_feat_cap <= 0) return true;
+    const size_t col_bytes = (size_t)cache_.target_feat->ne[0] *
+        ggml_element_size(cache_.target_feat);
+    for (int i = 0; i < n_tokens; i++) {
+        const int slot = (base_pos + i) % cache_.target_feat_cap;
+        const cudaError_t ce = cudaMemcpyAsync(
+            (char *)cache_.target_feat->data +
+                (size_t)slot * cache_.target_feat->nb[1],
+            (const char *)st->data + (size_t)i * st->nb[1],
+            col_bytes, cudaMemcpyDeviceToDevice, nullptr);
+        if (ce != cudaSuccess) {
+            std::fprintf(stderr, "flush_feat_staging: %s\n",
+                         cudaGetErrorString(ce));
+            return false;
+        }
+    }
+    cudaStreamSynchronize(nullptr);
+    return true;
+}
+
 bool Qwen35DFlashTarget::snapshot_kv() {
     // SpecLA applies only the already-committed pending path to durable state
     // during verify; current candidates remain in the factor bank. There is
     // therefore no speculative durable mutation to snapshot or undo.
+    snapshot_cur_pos_ = cache_.cur_pos;
     if (specla_active()) return true;
     if (!cache_.ssm_state.empty() && is_meta_tensor(cache_.ssm_state.front())) {
         return copy_meta_recurrent_state(
@@ -864,6 +1063,24 @@ bool Qwen35DFlashTarget::snapshot_kv() {
 }
 
 bool Qwen35DFlashTarget::restore_kv() {
+    const int dirty_end = cache_.cur_pos;
+    if (dirty_end > snapshot_cur_pos_) {
+        const int n_dirty = dirty_end - snapshot_cur_pos_;
+        auto clear_range = [&](const std::vector<ggml_tensor *> & tensors) {
+            for (ggml_tensor * tensor : tensors) {
+                if (!tensor) continue;
+                const int64_t heads = tensor->ne[2];
+                for (int64_t head = 0; head < heads; ++head) {
+                    const size_t offset = (size_t)head * tensor->nb[2] +
+                        (size_t)snapshot_cur_pos_ * tensor->nb[1];
+                    ggml_backend_tensor_memset(
+                        tensor, 0, offset, (size_t)n_dirty * tensor->nb[1]);
+                }
+            }
+        };
+        clear_range(cache_.attn_k);
+        clear_range(cache_.attn_v);
+    }
     if (specla_active()) {
         // A successful SpecLA verify has already folded the *previous*
         // accepted factors into the durable state, while the factors produced
@@ -872,14 +1089,19 @@ bool Qwen35DFlashTarget::restore_kv() {
         // snapshot.  Leaving the old count live would apply it a second time
         // when a replay graph starts.
         cache_.specla_pending_count = 0;
+        cache_.cur_pos = snapshot_cur_pos_;
         return true;
     }
     if (!cache_.ssm_state.empty() && is_meta_tensor(cache_.ssm_state.front())) {
-        return copy_meta_recurrent_state(
+        const bool ok = copy_meta_recurrent_state(
             cache_.ssm_state_snap, cache_.conv_state_snap,
             cache_.ssm_state, cache_.conv_state, backend_);
+        if (ok) cache_.cur_pos = snapshot_cur_pos_;
+        return ok;
     }
-    return restore_ssm_state(cache_, backend_);
+    const bool ok = restore_ssm_state(cache_, backend_);
+    if (ok) cache_.cur_pos = snapshot_cur_pos_;
+    return ok;
 }
 
 bool Qwen35DFlashTarget::supports_fast_rollback() const {
@@ -1069,6 +1291,31 @@ bool Qwen35DFlashTarget::rollback_to(int base_pos, int commit_n) {
         }
     } else {
         cudaStreamSynchronize(stream);
+    }
+
+    // Truncate KV: zero the attention rows the verify wrote past the commit
+    // boundary. Later masked verifies overwrite them anyway, but the maskless
+    // AR decode graph pads its flash-attention span past cur_pos and relies
+    // on unwritten cache rows being zero; leaving rejected-draft K/V there
+    // would leak into the softmax denominator of any AR step that follows.
+    const int truncate_end = cache_.cur_pos;
+    const int truncate_begin = base_pos + commit_n;
+    if (truncate_end > truncate_begin) {
+        const int n_stale = truncate_end - truncate_begin;
+        auto clear_range = [&](const std::vector<ggml_tensor *> & tensors) {
+            for (ggml_tensor * tensor : tensors) {
+                if (!tensor) continue;
+                const int64_t heads = tensor->ne[2];
+                for (int64_t head = 0; head < heads; ++head) {
+                    const size_t offset = (size_t)head * tensor->nb[2] +
+                        (size_t)truncate_begin * tensor->nb[1];
+                    ggml_backend_tensor_memset(
+                        tensor, 0, offset, (size_t)n_stale * tensor->nb[1]);
+                }
+            }
+        };
+        clear_range(cache_.attn_k);
+        clear_range(cache_.attn_v);
     }
 
     cache_.cur_pos = base_pos + commit_n;

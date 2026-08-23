@@ -31,6 +31,7 @@
 //   conv_kernel      = 4
 
 #include "internal.h"
+#include "graph_builders.h"
 #include "delta_net_chunked.h"
 #include "delta_net_specla.h"
 #include "kv_quant.h"
@@ -1094,7 +1095,9 @@ static ggml_tensor * build_full_attn_block(
     int paged_max_kv_len = 0,
     // Compact decode row -> physical block-table column. Negative ids are
     // graph-bucket padding rows.
-    ggml_tensor * active_slot_ids = nullptr
+    ggml_tensor * active_slot_ids = nullptr,
+    // AR-exact batched rows (see QwenGraphInputs::ar_exact_rows).
+    bool ar_exact_rows = false
 ) {
     const int head_dim = w.n_embd_head_k;
     const int n_head = w.n_head;
@@ -1185,7 +1188,12 @@ static ggml_tensor * build_full_attn_block(
     const bool ragged = paged_query_seq_ids != nullptr;
     GGML_ASSERT(!ragged || (paged_block_table && paged_query_positions &&
                             kv_write_rows));
-    if (kv_write_rows) {
+    GGML_ASSERT(!ar_exact_rows ||
+                (kv_write_rows && !attn_mask && fa_window == 0 &&
+                 !paged_block_table && !ragged && !active_slot_ids));
+    if (ar_exact_rows) {
+        // Interleaved per-row write+attend below; no whole-batch KV write.
+    } else if (kv_write_rows) {
         // Step-invariant: the destination tensor stays fixed while the input
         // indices carry contiguous, KVFlash, or paged physical rows.
         // ggml_set_rows requires a contiguous source. Expanded before the
@@ -1263,7 +1271,48 @@ static ggml_tensor * build_full_attn_block(
     };
 
     ggml_tensor * attn = nullptr;
-    if (ragged) {
+    if (ar_exact_rows) {
+        // AR-exact rows: for each row, write its K/V into the cache, then run
+        // the same maskless single-query flash-attention node the AR decode
+        // step uses (256-stride padded span; unwritten cache rows are zero).
+        // Node order enforces the write→attend→write→attend sequence, so row
+        // i attends rows [0, kv_start+i] plus the zero pad — exactly the
+        // cache state sequential AR would present. Later sibling rows are
+        // still zero, matching AR's not-yet-written rows.
+        ggml_tensor * rows_cat = nullptr;
+        for (int i = 0; i < n_tokens; i++) {
+            ggml_tensor * k_row = ggml_cont(ctx, ggml_view_3d(ctx, Kcur_T,
+                head_dim, 1, n_head_kv,
+                Kcur_T->nb[1], Kcur_T->nb[2], (size_t)i * Kcur_T->nb[1]));
+            ggml_tensor * v_row = ggml_cont(ctx, ggml_view_3d(ctx, Vcur_T,
+                head_dim, 1, n_head_kv,
+                Vcur_T->nb[1], Vcur_T->nb[2], (size_t)i * Vcur_T->nb[1]));
+            // kv_write_rows is [n_tokens, n_head_kv] ne0-major; row i's
+            // per-head indices are the strided column i (set_rows reads
+            // src1 through its nb strides).
+            ggml_tensor * rows_i = ggml_view_2d(ctx, kv_write_rows,
+                1, w.n_head_kv, kv_write_rows->nb[1],
+                (size_t)i * kv_write_rows->nb[0]);
+            ggml_build_forward_expand(gf, ggml_set_rows(ctx, cache_k, k_row, rows_i));
+            ggml_build_forward_expand(gf, ggml_set_rows(ctx, cache_v, v_row, rows_i));
+
+            const int kv_len_i = kv_start + i + 1;
+            int span_i = ((kv_len_i + 255) / 256) * 256;
+            span_i = std::min(span_i, (int)cache_k->ne[1]);
+            ggml_tensor * Kfa_i = ggml_view_3d(ctx, cache_k,
+                head_dim, span_i, n_head_kv,
+                cache_k->nb[1], cache_k->nb[2], 0);
+            ggml_tensor * Vfa_i = ggml_view_3d(ctx, cache_v,
+                head_dim, span_i, n_head_kv,
+                cache_v->nb[1], cache_v->nb[2], 0);
+            ggml_tensor * attn_i = ggml_flash_attn_ext(
+                ctx, q_segment(i, 1), Kfa_i, Vfa_i, /*mask=*/nullptr,
+                kq_scale, 0.0f, 0.0f);
+            ggml_build_forward_expand(gf, attn_i);
+            rows_cat = rows_cat ? ggml_concat(ctx, rows_cat, attn_i, 2) : attn_i;
+        }
+        attn = rows_cat;
+    } else if (ragged) {
         // ── Ragged concurrent step: prefill chunk rows and decode rows all
         // read the pool through one call, each row clamped to its own
         // inclusive position. This step's chunk rows are visible to their
@@ -1880,6 +1929,23 @@ after_delta_net:
     return out;
 }
 
+// ─── AR-exact build context (see graph_builders.h) ──────────────────
+static thread_local bool g_ar_exact_build = false;
+static thread_local ggml_tensor * g_ar_exact_feat_staging = nullptr;
+
+void qwen35_set_ar_exact_feat_staging(ggml_tensor * staging) {
+    g_ar_exact_feat_staging = staging;
+}
+
+Qwen35ArExactBuildScope::Qwen35ArExactBuildScope(bool enabled)
+    : prev_(g_ar_exact_build) {
+    g_ar_exact_build = enabled;
+}
+
+Qwen35ArExactBuildScope::~Qwen35ArExactBuildScope() {
+    g_ar_exact_build = prev_;
+}
+
 // ─── Main graph builder ─────────────────────────────────────────────
 
 // Build a single layer of the Qwen3.5-27B model.
@@ -2063,7 +2129,8 @@ QwenGraphOutputs build_qwen35_graph(
                                         in.paged_query_seq_ids,
                                         in.paged_query_positions,
                                         in.paged_max_kv_len,
-                                        in.active_slot_ids);
+                                        in.active_slot_ids,
+                                        g_ar_exact_build);
             if (want_q_cap && q_fa) {
                 // Last token's Q, all heads: src [head_dim, 1, n_head] view of
                 // [head_dim, n_tokens, n_head]; dst = q_cap plane fa_idx
@@ -2183,7 +2250,21 @@ QwenGraphOutputs build_qwen35_graph(
             for (int k = 0; k < N_CAPTURE; k++) {
                 if (CAPTURE_LAYERS[k] == il) { capture_idx = k; break; }
             }
-            if (capture_idx >= 0) {
+            if (capture_idx >= 0 && g_ar_exact_build &&
+                g_ar_exact_feat_staging &&
+                n_tokens <= (int)g_ar_exact_feat_staging->ne[1]) {
+                // Step-invariant capture: write to the fixed-offset staging
+                // tensor so node properties stay identical across decode
+                // steps (CUDA graph replay). verify_batch copies the staged
+                // columns into the target_feat ring after compute.
+                ggml_tensor * st = g_ar_exact_feat_staging;
+                const size_t elt = ggml_element_size(st);
+                ggml_tensor * cur_2d = ggml_reshape_2d(ctx, cur, hidden, n_tokens);
+                ggml_tensor * slot = ggml_view_2d(ctx, st,
+                    hidden, n_tokens, st->nb[1],
+                    (size_t)capture_idx * hidden * elt);
+                ggml_build_forward_expand(gf, ggml_cpy(ctx, cur_2d, slot));
+            } else if (capture_idx >= 0) {
                 const size_t elt        = ggml_element_size(cache.target_feat);
                 const size_t col_stride = cache.target_feat->nb[1];
                 const int    cap        = cache.target_feat_cap;

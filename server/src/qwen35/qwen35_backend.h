@@ -14,6 +14,7 @@
 #include "common/model_backend.h"
 #include "common/dflash_target.h"
 #include "common/dflash_draft_ipc.h"
+#include "common/dflash2_adaptive.h"
 #include "placement/placement_config.h"
 #include "placement/remote_draft_config.h"
 #include "step_graph.h"
@@ -259,6 +260,10 @@ private:
     TargetWeights  w_;
     DraftWeights   dw_;
     TargetCache    cache_;
+    // Full prompt tokens for the DFlash2 diagnostic probe path. The native
+    // batched probe is restored by a fresh prefill before exact AR commit.
+    std::vector<int32_t> active_prompt_tokens_;
+    bool active_prompt_rebuild_allowed_ = false;
 
     // ── Graph containers (persistent gallocr buffers) ────────────────
     StepGraph      sg_;           // target forward (verify / prefill)
@@ -271,6 +276,8 @@ private:
     // DFLASH_DRAFT_KV=0). Shared module: common/dflash_draft_kv.h.
     DraftKvState draft_kv_;
     DFlashDraftIpcClient remote_draft_;
+    DFlash2Telemetry dflash2_telemetry_;
+    std::vector<int32_t> dflash2_observed_depths_;
 
     // ── Prefix cache (snapshots) ─────────────────────────────────────
     static constexpr int PREFIX_SLOTS = 64;

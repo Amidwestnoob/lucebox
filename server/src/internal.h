@@ -235,12 +235,12 @@ void free_target_weights(TargetWeights & w);
 // ─── Draft weights (z-lab DFlash, bf16) ───────────────────────────
 
 struct DraftLayer {
-    ggml_tensor * attn_norm;
-    ggml_tensor * ffn_norm;
-    ggml_tensor * wq;
-    ggml_tensor * wk;
-    ggml_tensor * wv;
-    ggml_tensor * wo;
+    ggml_tensor * attn_norm = nullptr;
+    ggml_tensor * ffn_norm = nullptr;
+    ggml_tensor * wq = nullptr;
+    ggml_tensor * wk = nullptr;
+    ggml_tensor * wv = nullptr;
+    ggml_tensor * wo = nullptr;
     ggml_tensor * attn_gate = nullptr;  // optional Laguna XS 2.1 attention gate
     ggml_tensor * q_norm;
     ggml_tensor * k_norm;
@@ -249,6 +249,14 @@ struct DraftLayer {
     ggml_tensor * w_down;
     bool is_swa = false;  // true for SWA layers (Qwen3.6 pattern)
     bool attn_gate_per_head = false;
+
+    // Qwen3.8 DFlash2 grouped two-tap convolutions. The projected tensor has
+    // 4 * (n_embd / conv_group_size) coefficients per token and the base
+    // tensor is [n_embd, conv_kernel_size, 2].
+    ggml_tensor * dflash2_attn_conv_base = nullptr;
+    ggml_tensor * dflash2_attn_conv_proj = nullptr;
+    ggml_tensor * dflash2_ffn_conv_base  = nullptr;
+    ggml_tensor * dflash2_ffn_conv_proj  = nullptr;
 };
 
 struct DraftDominoWeights {
@@ -309,6 +317,23 @@ struct DraftWeights {
     float rope_beta_fast  = 0.0f;
     float rope_beta_slow  = 0.0f;
     int   rope_n_ctx_orig = 0;      // original_max_position_embeddings
+
+    // Qwen3.8 DFlash2 decoder extensions. Ordinary DFlash drafts leave these
+    // disabled and retain the legacy graph/selector behavior.
+    bool dflash2 = false;
+    int  dflash2_conv_kernel_size = 0;
+    int  dflash2_conv_group_size  = 0;
+    int  dflash2_selector_rank    = 0;
+    int  dflash2_selector_top_k   = 0;
+    ggml_tensor * dflash2_selector_hidden = nullptr;
+    ggml_tensor * dflash2_selector_pred   = nullptr;
+    ggml_tensor * dflash2_selector_succ   = nullptr;
+    // Q4_K selector codebooks are expanded to F32 at load time because the
+    // backend get-rows kernels intentionally do not support Q4_K sources.
+    ggml_tensor * dflash2_selector_pred_f32 = nullptr;
+    ggml_tensor * dflash2_selector_succ_f32 = nullptr;
+    ggml_context * dflash2_selector_ctx = nullptr;
+    ggml_backend_buffer_t dflash2_selector_buf = nullptr;
 
     // DFlash draft-specific config (populated by loader or set by caller).
     int block_size      = DFLASH27B_DRAFT_BLOCK_SIZE;       // tokens per draft step (16 or 10)

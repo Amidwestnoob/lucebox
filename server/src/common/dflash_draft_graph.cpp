@@ -55,6 +55,13 @@ static bool build_draft_graph_internal(
     ggml_set_name(sg.inp_embed, "inp_embed");
     ggml_set_input(sg.inp_embed);
 
+    sg.anchor_token = nullptr;
+    if (dw.dflash2) {
+        sg.anchor_token = ggml_new_tensor_1d(sg.ctx, GGML_TYPE_I32, 1);
+        ggml_set_name(sg.anchor_token, "dflash2_anchor_token");
+        ggml_set_input(sg.anchor_token);
+    }
+
     if (mirror_view) {
         const size_t stride = mirror->target_feat->nb[1];
         sg.target_hidden_cat = ggml_view_3d(
@@ -113,17 +120,22 @@ static bool build_draft_graph_internal(
     gi.target_hidden_cat = sg.target_hidden_cat;
     gi.positions_q       = sg.positions;
     gi.positions_k       = sg.positions_k;
+    gi.anchor_token      = sg.anchor_token;
     gi.lm_head           = lm_head;
     gi.causal_mask_swa   = sg.attn_mask;
     gi.pad_mask_full     = sg.pad_mask_full;
     DraftGraphOutputs go = build_draft_graph(sg.ctx, dw, gi);
     sg.hidden_states = go.hidden_states;
     sg.logits = go.logits;
+    sg.selector_tokens = go.selector_tokens;
     if (!sg.hidden_states) {
         std::fprintf(stderr, "draft graph missing hidden_states\n");
         return false;
     }
-    if (sg.logits) {
+    if (sg.selector_tokens) {
+        ggml_set_output(sg.selector_tokens);
+        ggml_build_forward_expand(sg.gf, sg.selector_tokens);
+    } else if (sg.logits) {
         sg.argmax_tokens = ggml_argmax(sg.ctx, sg.logits);
         ggml_set_name(sg.argmax_tokens, "argmax_tokens");
         ggml_set_output(sg.argmax_tokens);

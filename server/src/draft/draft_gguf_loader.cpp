@@ -26,6 +26,7 @@
 
 #include "internal.h"
 #include "common/derived_scalars.h"
+#include "common/dflash2_tensor_names.h"
 #include "common/gguf_mmap.h"
 #include "common/gguf_bounds.h"
 
@@ -127,9 +128,10 @@ bool load_draft_gguf(const std::string & path,
         arch_s = arch;
         if (arch_s != "qwen35-dflash-draft" &&
             arch_s != "dflash-draft" &&
+            arch_s != "dflash" &&
             arch_s != "gemma4-dflash-draft") {
             set_last_error(std::string("unexpected draft arch: ") + arch +
-                           " (expected qwen35-dflash-draft, dflash-draft, or gemma4-dflash-draft)");
+                           " (expected qwen35-dflash-draft, dflash-draft, dflash, or gemma4-dflash-draft)");
             gguf_free(gctx);
             return false;
         }
@@ -149,6 +151,11 @@ bool load_draft_gguf(const std::string & path,
         if (id < 0) return fallback;
         return gguf_get_val_f32(gctx, id);
     };
+    auto read_dflash_u32 = [&](const char * suffix, uint32_t fallback) -> uint32_t {
+        return arch_s == "dflash"
+            ? get_u32_or(gctx, (std::string(A) + "." + suffix).c_str(), fallback)
+            : read_u32((std::string("dflash.") + suffix).c_str(), fallback);
+    };
 
     const uint32_t n_embd    = read_u32("embedding_length",        0);
     const uint32_t n_layer   = read_u32("block_count",             0);
@@ -156,8 +163,8 @@ bool load_draft_gguf(const std::string & path,
     const uint32_t n_head    = read_u32("attention.head_count",    0);
     const uint32_t n_head_kv = read_u32("attention.head_count_kv", 0);
     const uint32_t head_dim  = read_u32("attention.key_length",    0);
-    const uint32_t block_sz  = read_u32("dflash.block_size",       0);
-    uint32_t n_tgt_lay       = read_u32("dflash.n_target_layers",  0);
+    const uint32_t block_sz  = read_dflash_u32("block_size",       0);
+    uint32_t n_tgt_lay       = read_dflash_u32("n_target_layers",  0);
     const uint32_t domino_meta_enabled = read_u32("dflash.domino.enabled", 0);
     const uint32_t domino_meta_gru     = read_u32("dflash.domino.gru_hidden_dim", 0);
     const uint32_t domino_meta_emb     = read_u32("dflash.domino.emb_dim", 0);
@@ -170,16 +177,32 @@ bool load_draft_gguf(const std::string & path,
     // load without a hardcoded per-arch set; the array length also backstops
     // n_target_layers when the scalar KV is absent.
     {
-        std::snprintf(key, sizeof(key), "%s.%s", A, "dflash.target_layer_ids");
-        const int64_t target_ids_id = gguf_find_key(gctx, key);
-        if (target_ids_id >= 0 &&
-            gguf_get_kv_type(gctx, target_ids_id) == GGUF_TYPE_ARRAY &&
-            gguf_get_arr_type(gctx, target_ids_id) == GGUF_TYPE_INT32) {
-            const uint32_t n = (uint32_t)gguf_get_arr_n(gctx, target_ids_id);
-            const int32_t * vals =
-                (const int32_t *)gguf_get_arr_data(gctx, target_ids_id);
-            out.capture_layer_ids.assign(vals, vals + n);
+        auto read_layer_ids = [&](const char * suffix) {
+            std::snprintf(key, sizeof(key), "%s.%s", A, suffix);
+            const int64_t ids_id = gguf_find_key(gctx, key);
+            if (ids_id < 0 || gguf_get_kv_type(gctx, ids_id) != GGUF_TYPE_ARRAY) {
+                return false;
+            }
+            const gguf_type element_type = gguf_get_arr_type(gctx, ids_id);
+            if (element_type != GGUF_TYPE_INT32 && element_type != GGUF_TYPE_UINT32) {
+                return false;
+            }
+            const uint32_t n = (uint32_t)gguf_get_arr_n(gctx, ids_id);
+            const void * raw = gguf_get_arr_data(gctx, ids_id);
+            out.capture_layer_ids.clear();
+            out.capture_layer_ids.reserve(n);
+            for (uint32_t i = 0; i < n; ++i) {
+                out.capture_layer_ids.push_back(element_type == GGUF_TYPE_INT32
+                    ? static_cast<const int32_t *>(raw)[i]
+                    : static_cast<const uint32_t *>(raw)[i]);
+            }
             if (n_tgt_lay == 0) n_tgt_lay = n;
+            return true;
+        };
+        // Published DFlash2 uses `target_layers`; older exports use the
+        // explicit `target_layer_ids` spelling.
+        if (!read_layer_ids("dflash.target_layer_ids")) {
+            read_layer_ids("target_layers");
         }
     }
     if (n_tgt_lay == 0 && n_embd != 0) {
@@ -256,7 +279,9 @@ bool load_draft_gguf(const std::string & path,
     };
 
     out.fc          = g_any("dflash.fc.weight", "dflash_fc.weight");
+    if (!out.fc) out.fc = g("fc.weight");
     out.hidden_norm = g_any("dflash.hidden_norm.weight", "dflash_hidden_norm.weight");
+    if (!out.hidden_norm) out.hidden_norm = g("enc.output_norm.weight");
     out.out_norm    = g("output_norm.weight");
     if (!out.fc || !out.hidden_norm || !out.out_norm) {
         set_last_error("draft GGUF: missing top-level tensors "
@@ -287,6 +312,13 @@ bool load_draft_gguf(const std::string & path,
             std::snprintf(name, sizeof(name), "blk.%d.%s", il, suffix);
             return ggml_get_tensor(meta_ctx, name);
         };
+        auto fnd_any = [&](const char * suffix) -> ggml_tensor * {
+            if (ggml_tensor * t = fnd(suffix)) return t;
+            const std::string canonical = std::string("blk.") +
+                std::to_string(il) + "." + suffix;
+            const std::string alias = dflash2_tensor_alias(canonical);
+            return alias.empty() ? nullptr : g(alias.c_str());
+        };
         DraftLayer & L = out.layers[il];
         L.attn_norm = fnd("attn_norm.weight");
         L.ffn_norm  = fnd("ffn_norm.weight");
@@ -301,6 +333,10 @@ bool load_draft_gguf(const std::string & path,
         L.w_gate    = fnd("ffn_gate.weight");
         L.w_up      = fnd("ffn_up.weight");
         L.w_down    = fnd("ffn_down.weight");
+        L.dflash2_attn_conv_base = fnd_any("attn_conv.base");
+        L.dflash2_attn_conv_proj = fnd_any("attn_conv.proj.weight");
+        L.dflash2_ffn_conv_base  = fnd_any("ffn_conv.base");
+        L.dflash2_ffn_conv_proj  = fnd_any("ffn_conv.proj.weight");
         if (!L.attn_norm || !L.ffn_norm || !L.wq || !L.wk || !L.wv || !L.wo ||
             !L.q_norm || !L.k_norm || !L.w_gate || !L.w_up || !L.w_down) {
             char b[128];
@@ -313,6 +349,37 @@ bool load_draft_gguf(const std::string & path,
         }
     }
 
+    auto get_canonical_or_alias = [&](const char * canonical) -> ggml_tensor * {
+        if (ggml_tensor * t = g(canonical)) return t;
+        const std::string alias = dflash2_tensor_alias(canonical);
+        return alias.empty() ? nullptr : g(alias.c_str());
+    };
+    out.dflash2_selector_hidden =
+        get_canonical_or_alias("selector.hidden_proj.weight");
+    out.dflash2_selector_pred =
+        get_canonical_or_alias("selector.pred_codebook");
+    out.dflash2_selector_succ =
+        get_canonical_or_alias("selector.succ_codebook");
+    out.dflash2_conv_kernel_size = (int)read_u32("conv_kernel_size", 0);
+    out.dflash2_conv_group_size  = (int)read_u32("conv_group_size", 0);
+    out.dflash2_selector_rank    = (int)read_u32("selector_rank", 0);
+    out.dflash2_selector_top_k   = (int)read_u32("selector_top_k", 0);
+    const bool dflash2_metadata =
+        out.dflash2_selector_hidden || out.dflash2_selector_pred ||
+        out.dflash2_selector_succ || out.dflash2_conv_kernel_size != 0 ||
+        out.dflash2_conv_group_size != 0;
+    out.dflash2 = arch_s == "dflash" || dflash2_metadata;
+    if (out.dflash2 &&
+        (out.dflash2_conv_kernel_size != 2 || out.dflash2_conv_group_size <= 0 ||
+         out.dflash2_selector_rank <= 0 || out.dflash2_selector_top_k <= 0 ||
+         !out.dflash2_selector_hidden || !out.dflash2_selector_pred ||
+         !out.dflash2_selector_succ)) {
+        set_last_error("draft GGUF: incomplete DFlash2 convolution/selector metadata");
+        ggml_free(meta_ctx);
+        out.ctx = nullptr;
+        gguf_free(gctx);
+        return false;
+    }
     const int n_gate_layers = count_attn_gate_layers(out);
     if (n_gate_layers != 0 && n_gate_layers != out.n_layer) {
         char b[160];
@@ -480,6 +547,32 @@ bool load_draft_gguf(const std::string & path,
         gguf_free(gctx);
         return false;
     }
+    if (out.dflash2) {
+        ggml_init_params selector_ip{};
+        selector_ip.mem_size = 2 * ggml_tensor_overhead() + 16 * 1024;
+        selector_ip.no_alloc = true;
+        out.dflash2_selector_ctx = ggml_init(selector_ip);
+        if (!out.dflash2_selector_ctx) {
+            set_last_error("draft GGUF: DFlash2 selector context allocation failed");
+            return false;
+        }
+        out.dflash2_selector_pred_f32 = ggml_new_tensor_2d(
+            out.dflash2_selector_ctx, GGML_TYPE_F32,
+            out.dflash2_selector_pred->ne[0],
+            out.dflash2_selector_pred->ne[1]);
+        out.dflash2_selector_succ_f32 = ggml_new_tensor_2d(
+            out.dflash2_selector_ctx, GGML_TYPE_F32,
+            out.dflash2_selector_succ->ne[0],
+            out.dflash2_selector_succ->ne[1]);
+        ggml_set_name(out.dflash2_selector_pred_f32, "selector_pred_f32");
+        ggml_set_name(out.dflash2_selector_succ_f32, "selector_succ_f32");
+        out.dflash2_selector_buf = ggml_backend_alloc_ctx_tensors(
+            out.dflash2_selector_ctx, backend);
+        if (!out.dflash2_selector_buf) {
+            set_last_error("draft GGUF: DFlash2 selector buffer allocation failed");
+            return false;
+        }
+    }
 
     // ── 4. mmap file and copy tensor bytes to CUDA ───────────────────────
     std::string err;
@@ -509,6 +602,56 @@ bool load_draft_gguf(const std::string & path,
         total += sz;
     }
 
+    if (out.dflash2) {
+        auto expand_selector_codebook = [&](ggml_tensor * src,
+                                            ggml_tensor * dst,
+                                            const char * canonical) {
+            std::string actual = canonical;
+            int64_t tid = gguf_find_tensor(gctx, actual.c_str());
+            if (tid < 0) {
+                const std::string alias = dflash2_tensor_alias(canonical);
+                actual = alias;
+                tid = alias.empty() ? -1 : gguf_find_tensor(gctx, alias.c_str());
+            }
+            if (tid < 0) return false;
+            const ggml_type src_type = gguf_get_tensor_type(gctx, tid);
+            const ggml_type_traits * traits = ggml_get_type_traits(src_type);
+            if (!traits || !traits->to_float) return false;
+            const int64_t row_elems = src->ne[0];
+            const int64_t rows = src->ne[1];
+            const size_t row_bytes = ggml_row_size(src_type, row_elems);
+            const size_t rel_off = gguf_get_tensor_offset(gctx, tid);
+            const size_t tensor_bytes = row_bytes * (size_t)rows;
+            if (!gguf_tensor_in_file(data_start, rel_off, tensor_bytes, mm_len)) {
+                return false;
+            }
+            const uint8_t * bytes = mm_addr + data_start + rel_off;
+            std::vector<float> expanded((size_t)row_elems * (size_t)rows);
+            for (int64_t row = 0; row < rows; ++row) {
+                traits->to_float(bytes + (size_t)row * row_bytes,
+                                 expanded.data() + (size_t)row * row_elems,
+                                 row_elems);
+            }
+            ggml_backend_tensor_set(dst, expanded.data(), 0,
+                                    expanded.size() * sizeof(float));
+            total += expanded.size() * sizeof(float);
+            std::fprintf(stderr,
+                "[draft GGUF] expanded DFlash2 selector %s (%s -> F32)\n",
+                canonical, ggml_type_name(src_type));
+            return true;
+        };
+        if (!expand_selector_codebook(out.dflash2_selector_pred,
+                                      out.dflash2_selector_pred_f32,
+                                      "selector.pred_codebook") ||
+            !expand_selector_codebook(out.dflash2_selector_succ,
+                                      out.dflash2_selector_succ_f32,
+                                      "selector.succ_codebook")) {
+            set_last_error("draft GGUF: failed to expand DFlash2 selector codebooks");
+            gguf_free(gctx);
+            return false;
+        }
+    }
+
     gguf_free(gctx);
 
     // Structural defense: derive head_dim / n_head / n_head_kv from weight
@@ -536,8 +679,12 @@ bool load_draft_gguf(const std::string & path,
         // ground truth, so when fc disagrees but is an exact multiple of
         // n_embd, derive the count from the tensor and warn. Fail only on
         // a genuinely inconsistent shape.
+        const int64_t derived_fc_in = out.fc->ne[0];
+        if (out.n_target_layers == 0 && out.n_embd > 0 &&
+            derived_fc_in % out.n_embd == 0) {
+            out.n_target_layers = (int)(derived_fc_in / out.n_embd);
+        }
         if (out.n_target_layers > 0) {
-            const int64_t derived_fc_in  = out.fc->ne[0];
             const int64_t expected_fc_in = (int64_t)out.n_target_layers * out.n_embd;
             if (derived_fc_in != expected_fc_in) {
                 if (out.n_embd > 0 && derived_fc_in % out.n_embd == 0) {
@@ -555,6 +702,36 @@ bool load_draft_gguf(const std::string & path,
                         (long long)derived_fc_in,
                         out.n_target_layers, out.n_embd, (long long)expected_fc_in);
                     set_last_error(buf);
+                    return false;
+                }
+            }
+        }
+        if (out.dflash2) {
+            const int64_t expected_proj = 2LL * out.dflash2_conv_kernel_size *
+                (out.n_embd / out.dflash2_conv_group_size);
+            if (out.n_embd % out.dflash2_conv_group_size != 0 ||
+                out.dflash2_selector_hidden->ne[0] != out.n_embd ||
+                out.dflash2_selector_hidden->ne[1] != out.dflash2_selector_rank ||
+                out.dflash2_selector_pred->ne[0] != out.dflash2_selector_rank ||
+                out.dflash2_selector_succ->ne[0] != out.dflash2_selector_rank) {
+                set_last_error("draft GGUF: DFlash2 selector shape mismatch");
+                return false;
+            }
+            for (const DraftLayer & L : out.layers) {
+                const bool base_ok = L.dflash2_attn_conv_base &&
+                    L.dflash2_ffn_conv_base &&
+                    L.dflash2_attn_conv_base->ne[0] == out.n_embd &&
+                    L.dflash2_attn_conv_base->ne[1] == out.dflash2_conv_kernel_size &&
+                    L.dflash2_attn_conv_base->ne[2] == 2 &&
+                    L.dflash2_ffn_conv_base->ne[0] == out.n_embd &&
+                    L.dflash2_ffn_conv_base->ne[1] == out.dflash2_conv_kernel_size &&
+                    L.dflash2_ffn_conv_base->ne[2] == 2;
+                const bool proj_ok = L.dflash2_attn_conv_proj &&
+                    L.dflash2_ffn_conv_proj &&
+                    L.dflash2_attn_conv_proj->ne[1] == expected_proj &&
+                    L.dflash2_ffn_conv_proj->ne[1] == expected_proj;
+                if (!base_ok || !proj_ok) {
+                    set_last_error("draft GGUF: DFlash2 convolution shape mismatch");
                     return false;
                 }
             }

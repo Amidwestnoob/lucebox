@@ -83,6 +83,12 @@ struct DFlashTarget {
     // returns (EOS, cancellation, or token budget).
     virtual bool finish_speculative_state() { return true; }
 
+    // A DFlash2 verify probe can omit feature-ring writes so the target probe
+    // remains numerically identical to the AR one-token graph. The committed
+    // replay re-enables capture before advancing the draft context.
+    virtual void set_capture_target_features(bool enabled) { (void)enabled; }
+    virtual void set_force_verify_mask(bool enabled) { (void)enabled; }
+
     // ── DDTree tree-structured verify ───────────────────────────────
     // Whether this target can verify a draft tree (ancestor-masked batched
     // forward over DFS-ordered tree nodes). When false, callers fall back to

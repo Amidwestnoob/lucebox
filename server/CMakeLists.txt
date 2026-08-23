@@ -1768,6 +1768,16 @@ if(DFLASH27B_TESTS)
             COMMENT "Discovering CppUnitTestFramework tests for ${target}")
     endfunction()
 
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_dflash2_contract.cpp")
+        add_executable(test_dflash2_contract
+            test/test_unit_main.cpp
+            test/test_dflash2_contract.cpp)
+        target_include_directories(test_dflash2_contract PRIVATE
+            ${DFLASH27B_SRC_INCLUDE_DIRS})
+        dflash_discover_cppunit_tests(test_dflash2_contract)
+        list(APPEND _raw_unit_test_targets test_dflash2_contract)
+    endif()
+
     set(_cppunit_test_targets
         test_server_unit
         test_model_smoke)

@@ -110,6 +110,20 @@ bool build_hybrid_full_layer_step(
 //     overrides logits_tail_rows. Multi-prompt steps need it because
 //     committing rows are scattered. 0 keeps the tail-view behavior.
 //   `logits_tail_rows` — logits/argmax only for the last n rows (0 = all).
+// AR-exact build context (qwen35-local, thread-local; graph builds are
+// single-threaded per backend call). Qwen35DFlashTarget registers its
+// feature-staging tensor while alive; build_target_step raises the AR-exact
+// flag around build_qwen35_graph via the RAII scope. This keeps the
+// AR-exact plumbing inside the qwen35 tree instead of widening the shared
+// QwenGraphInputs struct.
+void qwen35_set_ar_exact_feat_staging(ggml_tensor * staging);
+struct Qwen35ArExactBuildScope {
+    explicit Qwen35ArExactBuildScope(bool enabled);
+    ~Qwen35ArExactBuildScope();
+private:
+    bool prev_;
+};
+
 bool build_target_step(
     StepGraph & sg,
     const TargetWeights & w,
@@ -134,7 +148,8 @@ bool build_target_step(
     const QwenPrefillSegment * prefill_segments = nullptr,
     int n_prefill_segments = 0,
     int n_logits_rows = 0,
-    bool compact_slots = false);
+    bool compact_slots = false,
+    bool ar_exact_rows = false);
 
 // Full target forward: DDTree tree-verify mode.
 bool build_target_step_tree(
