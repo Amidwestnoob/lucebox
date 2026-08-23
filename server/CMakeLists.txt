@@ -1958,6 +1958,22 @@ if(DFLASH27B_TESTS)
     endif()
     if((DFLASH27B_GPU_BACKEND STREQUAL "cuda" OR
         DFLASH27B_GPU_BACKEND STREQUAL "hip")
+       AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_kvflash_restore_rollback.cpp")
+        dflash_add_ggml_gpu_executable(
+            test_kvflash_restore_rollback
+            test/test_kvflash_restore_rollback.cpp)
+        target_include_directories(test_kvflash_restore_rollback PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/src/common)
+        add_test(NAME kvflash_restore_rollback
+                 COMMAND test_kvflash_restore_rollback)
+        add_test(NAME kvflash_restore_rollback_cpu
+                 COMMAND test_kvflash_restore_rollback --cpu)
+        if(TARGET check)
+            add_dependencies(check test_kvflash_restore_rollback)
+        endif()
+    endif()
+    if((DFLASH27B_GPU_BACKEND STREQUAL "cuda" OR
+        DFLASH27B_GPU_BACKEND STREQUAL "hip")
        AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_concat_transpose.cpp")
         dflash_add_ggml_gpu_executable(
             test_concat_transpose test/test_concat_transpose.cpp)

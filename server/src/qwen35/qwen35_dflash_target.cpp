@@ -2,6 +2,7 @@
 
 #include "qwen35_dflash_target.h"
 #include "delta_net_specla.h"
+#include "dflash_kv_restore.h"
 #include "graph_builders.h"
 #include "step_graph.h"
 #include "attn_masks.h"
@@ -1063,24 +1064,14 @@ bool Qwen35DFlashTarget::snapshot_kv() {
 }
 
 bool Qwen35DFlashTarget::restore_kv() {
-    const int dirty_end = cache_.cur_pos;
-    if (dirty_end > snapshot_cur_pos_) {
-        const int n_dirty = dirty_end - snapshot_cur_pos_;
-        auto clear_range = [&](const std::vector<ggml_tensor *> & tensors) {
-            for (ggml_tensor * tensor : tensors) {
-                if (!tensor) continue;
-                const int64_t heads = tensor->ne[2];
-                for (int64_t head = 0; head < heads; ++head) {
-                    const size_t offset = (size_t)head * tensor->nb[2] +
-                        (size_t)snapshot_cur_pos_ * tensor->nb[1];
-                    ggml_backend_tensor_memset(
-                        tensor, 0, offset, (size_t)n_dirty * tensor->nb[1]);
-                }
-            }
-        };
-        clear_range(cache_.attn_k);
-        clear_range(cache_.attn_v);
-    }
+    // Zero the K/V rows the rejected verify wrote past the snapshot. Under
+    // kvflash the pager_ maps logical positions to physical pool slots, so
+    // the cleanup resolves each dirty position through the pager's const
+    // slot lookup instead of memsetting the logical index range, which in
+    // the pooled layout would miss the dirty rows and clear unrelated
+    // resident rows; see dflash_kv_restore.h.
+    dflash_kv_clear_speculative_rows(cache_.attn_k, cache_.attn_v, pager_,
+                                     snapshot_cur_pos_, cache_.cur_pos);
     if (specla_active()) {
         // A successful SpecLA verify has already folded the *previous*
         // accepted factors into the durable state, while the factors produced
@@ -1121,6 +1112,19 @@ bool Qwen35DFlashTarget::rollback_to(int base_pos, int commit_n) {
     if (!fast_rollback_) {
         if (kFastRollbackDiag) {
             std::fprintf(stderr, "rollback_to: fast_rollback disabled\n");
+        }
+        return false;
+    }
+
+    // kvflash: verify runs slot-mapped without delta-intermediate capture
+    // (see verify_batch), so there are no per-step captures to roll back
+    // to, and the KV truncation below indexes rows by logical position,
+    // which does not hold in the pager's pooled layout. Report failure so
+    // the caller takes the exact restore_kv + replay path
+    // (supports_fast_rollback() advertises the same).
+    if (pager_ != nullptr) {
+        if (kFastRollbackDiag) {
+            std::fprintf(stderr, "rollback_to: kvflash pager active\n");
         }
         return false;
     }
@@ -1298,25 +1302,10 @@ bool Qwen35DFlashTarget::rollback_to(int base_pos, int commit_n) {
     // AR decode graph pads its flash-attention span past cur_pos and relies
     // on unwritten cache rows being zero; leaving rejected-draft K/V there
     // would leak into the softmax denominator of any AR step that follows.
-    const int truncate_end = cache_.cur_pos;
-    const int truncate_begin = base_pos + commit_n;
-    if (truncate_end > truncate_begin) {
-        const int n_stale = truncate_end - truncate_begin;
-        auto clear_range = [&](const std::vector<ggml_tensor *> & tensors) {
-            for (ggml_tensor * tensor : tensors) {
-                if (!tensor) continue;
-                const int64_t heads = tensor->ne[2];
-                for (int64_t head = 0; head < heads; ++head) {
-                    const size_t offset = (size_t)head * tensor->nb[2] +
-                        (size_t)truncate_begin * tensor->nb[1];
-                    ggml_backend_tensor_memset(
-                        tensor, 0, offset, (size_t)n_stale * tensor->nb[1]);
-                }
-            }
-        };
-        clear_range(cache_.attn_k);
-        clear_range(cache_.attn_v);
-    }
+    // (pager_ is null here — the kvflash guard above returned early — so
+    // this is the dense contiguous-row layout by construction.)
+    dflash_kv_clear_speculative_rows(cache_.attn_k, cache_.attn_v, pager_,
+                                     base_pos + commit_n, cache_.cur_pos);
 
     cache_.cur_pos = base_pos + commit_n;
     return true;
