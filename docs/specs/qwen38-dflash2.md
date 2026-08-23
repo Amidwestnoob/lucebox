@@ -86,11 +86,12 @@ The non-streaming API reports bounded telemetry under `usage.dflash2`:
 }
 ```
 
-`observed_depths` is capped at 256 entries per request. The server emits
-`[dflash2] proposed=N accepted=N depth=N` lines for raw benchmark evidence;
-with the native commit opted in there is no `[ar-decode]` line for a DFlash2
-request (its presence marks the default diagnostic mode or an unrelated AR
-tail-off).
+`observed_depths` is capped at 256 entries per request. With
+`DFLASH_DFLASH2_DIAG=1` the server additionally emits per-step
+`[dflash2] proposed=N accepted=N depth=N` diagnostic lines (off by
+default: the print sits in the decode hot loop); with the native commit
+opted in there is no `[ar-decode]` line for a DFlash2 request (its
+presence marks the default diagnostic mode or an unrelated AR tail-off).
 
 ## Deterministic verification
 
@@ -98,15 +99,26 @@ The focused host contract tests cover alias resolution, adaptive bounds and
 expansion/contraction (including the depth floor regression), the native
 commit width cap, disabled-path behavior, telemetry accounting, and exact
 prefix/replay semantics. `test_ar_step_input_layout` pins the
-upload-after-rebuild input protocol behind the AR positions fix. The
-model-backed acceptance package is produced by:
+upload-after-rebuild input protocol behind the AR positions fix.
+`test_kvflash_restore_rollback` pins speculative restore/rollback K/V
+cleanup for both cache layouts: dense (row index == logical position) and
+KVFlash pooled (rows resolved through the pager's slot mapping), proving
+unrelated physical slots survive a rejected speculation. All of these
+register with ctest and run from a plain test build.
+
+The model-backed acceptance evidence is produced by the generic harness
+(model paths are required arguments; results and a parity/acceleration
+gate are written to the output directory):
 
 ```text
-python3 benchmarks/run_qwen38_dflash2_benchmark.py
-bash VERIFY_UPSTREAM_QWEN38_DFLASH2.sh
+python3 benchmarks/run_qwen38_dflash2.py \
+    --server-bin build/dflash_server \
+    --target /path/to/target.gguf --draft /path/to/dflash2-draft.gguf \
+    --gpu 0 --output-dir bench-out/qwen38-dflash2
 ```
 
 The benchmark uses one RTX 3090, one warmup, three measured repetitions,
 fixed greedy settings, fresh server processes for Baseline A1, adaptive Q4
 DFlash2, and Baseline A2, and exact output SHA-256 comparisons for prose, code,
-and repeated-context workloads.
+and repeated-context workloads. The measured summary lives in
+`docs/specs/qwen38-dflash2-benchmark.md`.

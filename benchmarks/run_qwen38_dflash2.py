@@ -11,9 +11,12 @@ codes. The assembled result asserts byte-exact SHA-256 output parity across
 all three conditions and requires the DFlash2 mean decode throughput to
 exceed the A1/A2 midpoint on every workload.
 
-Model paths are required and machine-neutral: pass --target-gguf and
---draft-gguf, or set QWEN38_TARGET_GGUF and QWEN38_DRAFT_GGUF. Optional
-QWEN38_TARGET_SHA256 / QWEN38_DRAFT_SHA256 pin the exact model files.
+Model paths are required and must be supplied explicitly:
+
+    python3 benchmarks/run_qwen38_dflash2.py \
+        --server-bin build/dflash_server \
+        --target /path/to/target.gguf --draft /path/to/dflash2-draft.gguf \
+        --gpu 0 --output-dir bench-out/qwen38-dflash2
 
 Conditions can run in separate invocations (--only <condition>, then
 --assemble) so an interrupted session never loses completed evidence.
@@ -37,7 +40,6 @@ from pathlib import Path
 from typing import Any
 
 ROOT = Path(__file__).resolve().parents[1]
-SERVER = ROOT / "build/dflash_server"
 WORKLOADS = ROOT / "benchmarks/qwen38_dflash2_workloads.json"
 REPS = 3
 WARMUPS = 1
@@ -66,23 +68,16 @@ class Config:
     """Resolved benchmark inputs and output locations."""
 
     def __init__(self, args: argparse.Namespace) -> None:
-        self.target = Path(args.target_gguf or os.environ.get("QWEN38_TARGET_GGUF", ""))
-        self.draft = Path(args.draft_gguf or os.environ.get("QWEN38_DRAFT_GGUF", ""))
-        if not str(self.target) or not str(self.draft):
-            raise SystemExit(
-                "model paths are required: pass --target-gguf/--draft-gguf or "
-                "set QWEN38_TARGET_GGUF and QWEN38_DRAFT_GGUF")
-        self.expect_target_sha = os.environ.get("QWEN38_TARGET_SHA256", "")
-        self.expect_draft_sha = os.environ.get("QWEN38_DRAFT_SHA256", "")
-        self.run_dir = Path(
-            args.run_dir
-            or os.environ.get("QWEN38_BENCH_RUN_DIR", str(ROOT / "bench-out/qwen38-dflash2")))
-        self.out_json = Path(args.out_json) if args.out_json else (
-            self.run_dir / "benchmark_qwen38_dflash2.json")
-        self.out_raw = Path(args.out_raw) if args.out_raw else (
-            self.run_dir / "benchmark_qwen38_dflash2_raw.log")
+        self.server_bin = Path(args.server_bin)
+        self.target = Path(args.target)
+        self.draft = Path(args.draft)
+        self.gpu = str(args.gpu)
+        self.expect_target_sha = args.expect_target_sha256 or ""
+        self.expect_draft_sha = args.expect_draft_sha256 or ""
+        self.output_dir = Path(args.output_dir)
+        self.out_json = self.output_dir / "benchmark_qwen38_dflash2.json"
+        self.out_raw = self.output_dir / "benchmark_qwen38_dflash2_raw.log"
         self.port_base = args.port_base
-        self.cuda_visible = os.environ.get("CUDA_VISIBLE_DEVICES", "0")
 
 
 def sha256_file(path: Path) -> str:
@@ -278,7 +273,7 @@ def make_run(
 
 def server_command(cfg: Config, draft: bool, port: int) -> list[str]:
     command = [
-        str(SERVER),
+        str(cfg.server_bin),
         str(cfg.target),
         "--target-device",
         "cuda:0",
@@ -318,12 +313,12 @@ def run_condition(cfg: Config, condition: str, spec: dict[str, Any],
     """
     port = cfg.port_base + index
     command = server_command(cfg, spec["draft"], port)
-    env_overrides = {"CUDA_VISIBLE_DEVICES": cfg.cuda_visible, **spec["env"]}
+    env_overrides = {"CUDA_VISIBLE_DEVICES": cfg.gpu, **spec["env"]}
     env = os.environ.copy()
     env.update(env_overrides)
     native_commit_env = env.get("DFLASH_DFLASH2_NATIVE_COMMIT") == "1"
-    stdout_path = cfg.run_dir / f"{condition}.stdout.log"
-    stderr_path = cfg.run_dir / f"{condition}.stderr.log"
+    stdout_path = cfg.output_dir / f"{condition}.stdout.log"
+    stderr_path = cfg.output_dir / f"{condition}.stderr.log"
     with (
         stdout_path.open("w", encoding="utf-8") as stdout,
         stderr_path.open("w", encoding="utf-8") as stderr,
@@ -418,7 +413,7 @@ def run_condition(cfg: Config, condition: str, spec: dict[str, Any],
 
 
 def preflight(cfg: Config) -> tuple[str, str, dict[str, Any]]:
-    required = [SERVER, cfg.target, cfg.draft, WORKLOADS]
+    required = [cfg.server_bin, cfg.target, cfg.draft, WORKLOADS]
     missing = [str(path) for path in required if not path.exists()]
     if missing:
         raise SystemExit("missing required inputs: " + ", ".join(missing))
@@ -431,14 +426,14 @@ def preflight(cfg: Config) -> tuple[str, str, dict[str, Any]]:
         raise SystemExit(
             f"draft model hash mismatch: {draft_sha} != {cfg.expect_draft_sha}")
     workloads = json.loads(WORKLOADS.read_text(encoding="utf-8"))["workloads"]
-    cfg.run_dir.mkdir(parents=True, exist_ok=True)
+    cfg.output_dir.mkdir(parents=True, exist_ok=True)
     return target_sha, draft_sha, workloads
 
 
 def result_skeleton(cfg: Config, target_sha: str, draft_sha: str,
                     workloads: dict[str, Any]) -> dict[str, Any]:
     source_commit = subprocess.run(
-        ["git", "rev-parse", "HEAD"], cwd=ROOT, capture_output=True, text=True, check=True
+        ["git", "rev-parse", "HEAD"], cwd=ROOT, capture_output=True, text=True, check=False
     ).stdout.strip()
     gpu = gpu_info()
     return {
@@ -454,7 +449,7 @@ def result_skeleton(cfg: Config, target_sha: str, draft_sha: str,
             "repetitions": REPS,
             "greedy": True,
             "seed": 123,
-            "cuda_visible_devices": cfg.cuda_visible,
+            "cuda_visible_devices": cfg.gpu,
             "context": 512,
             "endpoint": "/v1/chat/completions",
             "native_commit_env": "DFLASH_DFLASH2_NATIVE_COMMIT=1",
@@ -468,7 +463,7 @@ def result_skeleton(cfg: Config, target_sha: str, draft_sha: str,
 
 
 def run_one(cfg: Config, condition: str) -> int:
-    """Run one condition and persist its record + raw fragment to the run dir."""
+    """Run one condition and persist its record + raw fragment."""
     if condition not in CONDITIONS:
         print(f"unknown condition {condition}", file=sys.stderr)
         return 2
@@ -485,9 +480,9 @@ def run_one(cfg: Config, condition: str) -> int:
     record["sampler_peak_vram_mib"] = max(
         (value for _, value in sampler.samples), default=None
     )
-    (cfg.run_dir / f"{condition}.runs.json").write_text(
+    (cfg.output_dir / f"{condition}.runs.json").write_text(
         json.dumps(record, ensure_ascii=False), encoding="utf-8")
-    (cfg.run_dir / f"{condition}.raw.txt").write_text(
+    (cfg.output_dir / f"{condition}.raw.txt").write_text(
         "".join(raw), encoding="utf-8")
     ok = record["server_exit_code"] == 0 and all(
         run["exit_code"] == 0
@@ -516,8 +511,8 @@ def assemble(cfg: Config) -> int:
     ]
     peaks: list[int] = []
     for condition in CONDITIONS:
-        runs_path = cfg.run_dir / f"{condition}.runs.json"
-        raw_path = cfg.run_dir / f"{condition}.raw.txt"
+        runs_path = cfg.output_dir / f"{condition}.runs.json"
+        raw_path = cfg.output_dir / f"{condition}.raw.txt"
         if not runs_path.exists() or not raw_path.exists():
             print(f"missing condition evidence: {condition}", file=sys.stderr)
             return 2
@@ -605,7 +600,6 @@ def assemble(cfg: Config) -> int:
         else "failed_or_divergent"
     )
 
-    cfg.out_json.parent.mkdir(parents=True, exist_ok=True)
     cfg.out_json.write_text(
         json.dumps(result, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
     cfg.out_raw.write_text("".join(raw).rstrip("\n") + "\n", encoding="utf-8")
@@ -630,18 +624,21 @@ def main() -> int:
     parser = argparse.ArgumentParser(
         description="A1/DFlash2/A2 controlled benchmark for the Qwen3.8 "
                     "DFlash2 native commit (exact-parity gate included)")
-    parser.add_argument("--target-gguf",
-                        help="target model GGUF path "
-                             "(or env QWEN38_TARGET_GGUF)")
-    parser.add_argument("--draft-gguf",
-                        help="DFlash2 draft model GGUF path "
-                             "(or env QWEN38_DRAFT_GGUF)")
-    parser.add_argument("--run-dir",
-                        help="directory for per-condition records and server "
-                             "logs (or env QWEN38_BENCH_RUN_DIR; default "
-                             "bench-out/qwen38-dflash2)")
-    parser.add_argument("--out-json", help="assembled result JSON path")
-    parser.add_argument("--out-raw", help="assembled raw evidence log path")
+    parser.add_argument("--server-bin", default=str(ROOT / "build/dflash_server"),
+                        help="dflash_server binary to benchmark")
+    parser.add_argument("--target", required=True,
+                        help="target model GGUF path (required)")
+    parser.add_argument("--draft", required=True,
+                        help="DFlash2 draft model GGUF path (required)")
+    parser.add_argument("--gpu", default="0",
+                        help="CUDA_VISIBLE_DEVICES value for the server (default 0)")
+    parser.add_argument("--output-dir", default=str(ROOT / "bench-out/qwen38-dflash2"),
+                        help="directory for per-condition records, server logs, "
+                             "and assembled results")
+    parser.add_argument("--expect-target-sha256", default="",
+                        help="optional expected SHA-256 of the target model")
+    parser.add_argument("--expect-draft-sha256", default="",
+                        help="optional expected SHA-256 of the draft model")
     parser.add_argument("--port-base", type=int, default=18260)
     parser.add_argument("--only", metavar="CONDITION",
                         help="run a single condition: " + ", ".join(CONDITIONS))

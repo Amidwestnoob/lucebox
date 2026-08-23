@@ -3361,9 +3361,18 @@ bool Qwen35Backend::do_spec_decode(int committed, int n_gen,
                 dflash2_depth, std::max(0, accept_n - 1));
             dflash2_adaptive.observe(dflash2_depth, accepted_draft);
             dflash2_telemetry_ = dflash2_adaptive.telemetry();
-            std::fprintf(stderr,
-                "[dflash2] proposed=%d accepted=%d depth=%d\n",
-                dflash2_depth, accepted_draft, dflash2_depth);
+            // Per-step acceptance diagnostic in the decode hot loop: opt in
+            // with DFLASH_DFLASH2_DIAG=1. Bounded per-request telemetry
+            // always flows through usage.dflash2 in the response instead.
+            static const bool kDflash2Diag = []() {
+                const char * e = std::getenv("DFLASH_DFLASH2_DIAG");
+                return e != nullptr && std::strcmp(e, "0") != 0;
+            }();
+            if (kDflash2Diag) {
+                std::fprintf(stderr,
+                    "[dflash2] proposed=%d accepted=%d depth=%d\n",
+                    dflash2_depth, accepted_draft, dflash2_depth);
+            }
         }
         if (dw_.dflash2 && !dflash2_native_commit_enabled()) {
             // The native target verify is authoritative for acceptance, but
