@@ -1936,6 +1936,18 @@ if(DFLASH27B_TESTS)
     endif()
     if((DFLASH27B_GPU_BACKEND STREQUAL "cuda" OR
         DFLASH27B_GPU_BACKEND STREQUAL "hip")
+       AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_ar_step_input_layout.cpp")
+        dflash_add_ggml_gpu_executable(
+            test_ar_step_input_layout test/test_ar_step_input_layout.cpp)
+        add_test(NAME ar_step_input_layout COMMAND test_ar_step_input_layout)
+        add_test(NAME ar_step_input_layout_cpu
+                 COMMAND test_ar_step_input_layout --cpu)
+        if(TARGET check)
+            add_dependencies(check test_ar_step_input_layout)
+        endif()
+    endif()
+    if((DFLASH27B_GPU_BACKEND STREQUAL "cuda" OR
+        DFLASH27B_GPU_BACKEND STREQUAL "hip")
        AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/test_concat_transpose.cpp")
         dflash_add_ggml_gpu_executable(
             test_concat_transpose test/test_concat_transpose.cpp)

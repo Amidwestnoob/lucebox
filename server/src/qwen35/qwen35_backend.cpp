@@ -2076,9 +2076,6 @@ bool Qwen35Backend::do_ar_decode(int committed, int n_gen,
         int32_t tok = out_tokens.back();
 
         if (!w_.embedder.embed(&tok, 1, embed_buf)) return false;
-        ggml_backend_tensor_set(sg_.inp_embed, embed_buf, 0, sizeof(float) * hidden);
-        int32_t pos4[4] = {committed, committed, committed, 0};
-        ggml_backend_tensor_set(sg_.positions, pos4, 0, sizeof(int32_t) * 4);
 
         // kvflash: graph carries a slot-validity mask alongside the
         // step-invariant set_rows write; the FA span clamps to the pool.
@@ -2097,6 +2094,16 @@ bool Qwen35Backend::do_ar_decode(int committed, int n_gen,
                                /*paged_attention=*/paged)) {
             return false;
         }
+
+        // Upload inputs only AFTER the graph rebuild: build_target_step
+        // reallocates sg_ tensors, and the n_tokens=1 layout differs from the
+        // preceding prefill graph's layout on the first iteration. Uploading
+        // before the rebuild left the first decode step reading stale bytes
+        // as M-RoPE positions, permanently tilting the position-`committed` K
+        // row in the cache (first token after every prefill).
+        ggml_backend_tensor_set(sg_.inp_embed, embed_buf, 0, sizeof(float) * hidden);
+        int32_t pos4[4] = {committed, committed, committed, 0};
+        ggml_backend_tensor_set(sg_.positions, pos4, 0, sizeof(int32_t) * 4);
 
         // Fill kv_write_rows with this step's cache slot for set_rows: the
         // paged append row, its pool slot in kvflash mode, or the logical
