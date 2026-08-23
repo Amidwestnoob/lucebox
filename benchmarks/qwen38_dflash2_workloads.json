@@ -1,0 +1,19 @@
+{
+  "workloads": {
+    "prose": {
+      "description": "Fixed technical prose generation.",
+      "prompt": "Write a concise technical essay for an engineer explaining why reproducible benchmarks must separate correctness from speed. Cover measurement variance, warmup, output hashing, and fair baselines. Use plain prose and do not use markdown headings.\n\n",
+      "n_predict": 192
+    },
+    "code": {
+      "description": "Fixed code-generation request.",
+      "prompt": "Write a complete Python 3 function named merge_intervals(intervals) that accepts a list of [start, end] integer pairs, merges overlapping or touching intervals, returns a new list sorted by start, and does not mutate the input. Include a short docstring and then provide a small deterministic example in a separate code block. Return only the code.\n\n",
+      "n_predict": 192
+    },
+    "repeated_context": {
+      "description": "Fixed repeated-context retrieval reproduction.",
+      "prompt": "You are answering a retrieval-augmented generation test. Reproduce the reference block below exactly, including every word, number, punctuation mark, and line break. Do not add a preface, explanation, bullets, or markdown fences.\n\nREFERENCE BLOCK\nThe Cedar index uses four shards, a 37-second refresh interval, and a 0.82 cosine threshold. During the April validation, shard C returned 128 records, shard A returned 96, shard B returned 104, and shard D returned 111. The auditor recorded request ID RAG-2048-CEDAR and checksum 7f3a9c.\nEND REFERENCE BLOCK\n\nThe reference block is repeated here because it is a retrieved context passage:\nThe Cedar index uses four shards, a 37-second refresh interval, and a 0.82 cosine threshold. During the April validation, shard C returned 128 records, shard A returned 96, shard B returned 104, and shard D returned 111. The auditor recorded request ID RAG-2048-CEDAR and checksum 7f3a9c.\n\nNow reproduce the reference block exactly.\n",
+      "n_predict": 192
+    }
+  }
+}
