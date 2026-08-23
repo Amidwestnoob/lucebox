@@ -108,9 +108,14 @@ def gpu_info() -> dict[str, Any]:
     )
 
 
-def gpu_used_mib() -> int | None:
+def gpu_used_mib(gpu: str) -> int | None:
     p = subprocess.run(
-        ["nvidia-smi", "--query-gpu=memory.used", "--format=csv,noheader,nounits"],
+        [
+            "nvidia-smi",
+            "--id=" + gpu,
+            "--query-gpu=memory.used",
+            "--format=csv,noheader,nounits",
+        ],
         capture_output=True,
         text=True,
         check=False,
@@ -127,14 +132,15 @@ def gpu_used_mib() -> int | None:
 
 
 class VramSampler:
-    def __init__(self) -> None:
+    def __init__(self, gpu: str) -> None:
+        self.gpu = gpu
         self.samples: list[tuple[float, int]] = []
         self.stop_event = threading.Event()
         self.thread = threading.Thread(target=self._run, daemon=True)
 
     def _run(self) -> None:
         while not self.stop_event.is_set():
-            value = gpu_used_mib()
+            value = gpu_used_mib(self.gpu)
             if value is not None:
                 self.samples.append((time.time(), value))
             self.stop_event.wait(0.10)
@@ -148,7 +154,7 @@ class VramSampler:
 
     def peak(self, start: float, end: float) -> int | None:
         values = [v for t, v in self.samples if start <= t <= end]
-        return max(values) if values else gpu_used_mib()
+        return max(values) if values else gpu_used_mib(self.gpu)
 
 
 def http_json(port: int, payload: dict[str, Any]) -> tuple[int, str, dict[str, Any] | None, str]:
@@ -470,7 +476,7 @@ def run_one(cfg: Config, condition: str) -> int:
     target_sha, draft_sha, workloads = preflight(cfg)
     index = list(CONDITIONS).index(condition)
     raw: list[str] = []
-    sampler = VramSampler()
+    sampler = VramSampler(cfg.gpu)
     sampler.start()
     try:
         record = run_condition(cfg, condition, CONDITIONS[condition], sampler,

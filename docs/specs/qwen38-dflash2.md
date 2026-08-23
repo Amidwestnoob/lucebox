@@ -43,15 +43,14 @@ zero would never observe acceptance again and could not recover), and expands
 toward the trained maximum when acceptance is at least 80%; the deterministic
 controller is covered by host tests.
 
-The native commit is experimental and off by default; opt in with
-`DFLASH_DFLASH2_NATIVE_COMMIT=1`. The historical divergence between the
-native replay and the target-only AR graph (first fault at position 69:
-replay 55404 vs AR 421) was root-caused to the AR decode loop itself: it
-uploaded `inp_embed`/`positions` before rebuilding the step graph, so the
-first decode forward after every prefill read stale bytes as M-RoPE
-positions and permanently tilted the first generated K row. With the upload
-order fixed, the native path is exact and the AR baseline changes to the
-truly correct trajectory.
+The native commit is experimental and off by default. Enable it with
+`DFLASH_DFLASH2_NATIVE_COMMIT=1`. The earlier replay mismatch first appeared
+at position 69. Replay selected token 55404, while the target-only AR graph
+selected token 421. The cause was in the AR decode loop. It uploaded
+`inp_embed` and `positions` before it rebuilt the step graph. The first decode
+after each prefill therefore read stale M-RoPE position data and wrote an
+incorrect first K row. The input-order fix makes the native path and the AR
+baseline follow the same corrected path.
 
 The native commit verifies through AR-exact batched rows: full-attention
 layers interleave one per-row `set_rows` KV write with one per-row maskless
@@ -59,22 +58,23 @@ flash-attention call over the same 256-padded span the AR decode graph uses,
 quantized projections force the per-column MMVQ path, and the verify width is
 capped at `kDflash2NativeCommitMaxDepth` (3 proposals + seed) so every
 projection keeps the single-geometry MMVQ launch class. Under those
-constraints each verify row's logits and state advance are bit-identical to
-sequential AR decode; greedy acceptance, the correction token, and the
+constraints, each verify row has the same logits and state advance as
+sequential AR decode. Greedy acceptance, the correction token, and the
 committed recurrent state (fast rollback from F32 checkpoints, with exact
 restore+replay as the fallback) all match target-only AR exactly.
-`DFLASH_DFLASH2_EXACT_MARGIN=<logits>` optionally re-derives near-tie steps
-token by token through the exact AR graph as defense in depth on unvalidated
-hardware. Without the `DFLASH_DFLASH2_NATIVE_COMMIT=1` opt-in, a DFlash2
+`DFLASH_DFLASH2_EXACT_MARGIN=<logits>` can recheck near-tie steps one token at
+a time through the exact AR graph on unvalidated hardware. Without the
+`DFLASH_DFLASH2_NATIVE_COMMIT=1` opt-in, a DFlash2
 draft runs the diagnostic probe mode (verify probes plus a fresh-prefill AR
 commit, identical output, no speedup claim). The bit-exactness argument for
 the native commit is validated on an RTX 3090 (SM 8.6) with a Q4_K_L target
 and Q4_K_M draft under greedy decoding; other GPUs, quantizations, or
 sampled decoding are outside the validated envelope.
 
-Set `DFLASH_DFLASH2_ADAPTIVE=0` to disable only adaptive depth and retain the
-full native draft depth. This does not change target verification or the
-no-draft autoregressive behavior.
+Set `DFLASH_DFLASH2_ADAPTIVE=0` to disable adaptive depth. The native path
+still limits proposal depth to `kDflash2NativeCommitMaxDepth` (3). This
+setting does not change target verification or no-draft autoregressive
+behavior.
 
 The non-streaming API reports bounded telemetry under `usage.dflash2`:
 

@@ -43,15 +43,15 @@ Baseline A2 match byte-for-byte (prose `59dab591ca362036…`, code
 
 Every DFlash2 repetition ran with the native commit active: accepted
 tokens > 0, no full-request AR replay marker in the request log, and
-clean server exits for all three conditions. Prose accelerates least
-(draft acceptance is content-limited); code and repeated context show
-the full native-commit benefit.
+clean server exits for all three conditions. Prose accelerates least because
+draft acceptance depends on the content. Code and repeated context have the
+largest gains in this test.
 
 ## Scope
 
 These numbers cover exactly the validated envelope stated in
 `qwen38-dflash2.md`: one RTX 3090 (SM 8.6), Q4_K_L target, Q4_K_M
 DFlash2 draft, greedy decoding, full attention, dense KV cache. Other
-GPUs, quantizations, sampled decoding, or KVFlash-paged runs are not
-claimed by this measurement; under paging the native commit is refused
-and the exact restore+replay path serves speculation.
+GPUs, quantizations, sampled decoding, or KVFlash-paged runs are outside this
+measurement. With KVFlash paging, the fast in-place commit is disabled. The
+pager-safe restore-and-replay path handles speculative tokens instead.
